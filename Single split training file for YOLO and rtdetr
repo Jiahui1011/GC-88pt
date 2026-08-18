@@ -1,0 +1,52 @@
+import torch, gc, os, statistics
+from ultralytics import YOLO, RTDETR
+DATA_PATH = "./gc-88pt-random-stratified/data.yaml"
+PROJECT_NAME = "Patient_Split_88pt_SingleSplit"
+MODEL_CONFIGS = [
+    ("yolov8m.pt",  "YOLOv8m",   "yolo",   20),
+    ("yolov9c.pt",  "YOLOv9c",   "yolo",   20),
+    ("yolov10m.pt", "YOLOv10m",  "yolo",   20),
+    ("yolo11m.pt",  "YOLOv11m",  "yolo",   20),
+    ("yolo12m.pt",  "YOLOv12m",  "yolo",   20),
+    ("rtdetr-l.pt", "RTDETR-L",  "rtdetr", 10),
+]
+TRAIN_ARGS = dict(
+    epochs=150, patience=15, imgsz=640, workers=4, device=0, exist_ok=True,
+    degrees=30.0, fliplr=0.5, flipud=0.5, scale=0.2, translate=0.1,
+    mosaic=0.0, mixup=0.0, copy_paste=0.0, hsv_h=0.01, hsv_s=0.5, hsv_v=0.3,
+    optimizer="AdamW", lr0=0.001, lrf=0.01, warmup_epochs=5, dropout=0.1,
+    box=4.0, cls=1.2, save=True, save_period=10, cache=True,
+)
+def reset_gpu():
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception as e:
+            print(f"GPU cleanup failed (non-fatal): {e}")
+    gc.collect()
+results_log = {}
+for weights, run_name, api_class, batch_size in MODEL_CONFIGS:
+    run_full_name = f"{run_name}_patient_split"
+    best_pt = os.path.join(PROJECT_NAME, run_full_name, "weights", "best.pt")
+    if os.path.exists(best_pt):
+        print(f"{run_name}: already trained (found {best_pt}) — skipping.")
+        results_log[run_name] = "ALREADY_DONE"
+        continue
+    print(f"\n{'='*60}\nTraining {run_name}\n{'='*60}")
+    reset_gpu()
+    try:
+        ModelClass = RTDETR if api_class == "rtdetr" else YOLO
+        model = ModelClass(weights)
+        model.train(data=DATA_PATH, batch=batch_size, project=PROJECT_NAME,
+                     name=run_full_name, **TRAIN_ARGS)
+        print(f"SUCCESS: {run_name}")
+        results_log[run_name] = "SUCCESS"
+    except Exception as e:
+        print(f"CRASHED: {run_name} - {e}")
+        results_log[run_name] = f"FAILED: {e}"
+    finally:
+        reset_gpu()
+print("\nULTRALYTICS-FAMILY SINGLE-SPLIT RESULTS")
+for name, status in results_log.items():
+    print(f"  {name:12s} -> {status}")
