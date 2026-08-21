@@ -1,0 +1,171 @@
+import torch, gc, os, re, statistics, json
+from collections import defaultdict
+from ultralytics import YOLO, RTDETR
+
+# ==== CONFIG ====
+DATA_PATH = "gc-90pt-4/data.yaml"
+PROJECT_NAME = "Patient_Split_90pt_SingleSplit_2"
+
+MODEL_CONFIGS = [
+    ("yolov8m.pt",  "YOLOv8m",   "yolo",   16),
+    ("yolov9c.pt",  "YOLOv9c",   "yolo",   16),
+    ("yolov10m.pt", "YOLOv10m",  "yolo",   16),
+    ("yolo11m.pt",  "YOLOv11m",  "yolo",   16),
+    ("yolo12m.pt",  "YOLOv12m",  "yolo",   16),
+    ("rtdetr-l.pt", "RTDETR-L",  "rtdetr", 10),
+]
+
+PATIENT_ID_REGEX = re.compile(r"([A-Za-z]+\d+)HE\d+", re.IGNORECASE)
+
+TRAIN_ARGS = dict(
+    epochs=150, patience=30, imgsz=640, workers=4, device=0, exist_ok=True,
+    degrees=15.0, fliplr=0.5, flipud=0.5, scale=0.2, translate=0.1,
+    mosaic = 0.0, mixup=0.0, copy_paste=0.0, hsv_h=0.01, hsv_s=0.5, hsv_v=0.3,
+    optimizer="AdamW", lr0=0.0001, lrf=0.01, warmup_epochs=5, dropout=0.0,
+    box=4.0, cls=1.0, save=True, save_period=10, cache=True,
+)
+# ==================
+
+
+def reset_gpu():
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception as e:
+            print(f"GPU cleanup failed (non-fatal): {e}")
+    gc.collect()
+
+
+def find_checkpoint(project_name, run_full_name, filename="best.pt"):
+    candidates = [
+        os.path.join(project_name, run_full_name, "weights", filename),
+        os.path.join("runs", "detect", project_name, run_full_name, "weights", filename),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    search_roots = [project_name, os.path.join("runs", "detect", project_name)]
+    for search_root in search_roots:
+        if not os.path.isdir(search_root):
+            continue
+        for root, _, files in os.walk(search_root):
+            if filename in files and run_full_name in root and "weights" in root:
+                return os.path.join(root, filename)
+    return None
+
+
+def load_model(weights_path, api_class):
+    return RTDETR(weights_path) if api_class == "rtdetr" else YOLO(weights_path)
+
+
+def has_ground_truth(label_path):
+    if not os.path.exists(label_path):
+        return False
+    with open(label_path) as f:
+        return any(line.strip() for line in f)
+
+
+def evaluate_presence_absence(model, images_dir, labels_dir):
+    records = []
+    for r in model.predict(source=images_dir, conf=0.001, verbose=False, stream=True):
+        fname = os.path.basename(r.path)
+        lbl_path = os.path.join(labels_dir, os.path.splitext(fname)[0] + ".txt")
+        gt = 1 if has_ground_truth(lbl_path) else 0
+        max_conf = float(r.boxes.conf.max().item()) if r.boxes is not None and len(r.boxes) > 0 else 0.0
+        m = PATIENT_ID_REGEX.search(fname)
+        pid = m.group(1).upper() if m else "UNKNOWN"
+        records.append({"patient_id": pid, "gt": gt, "conf": max_conf})
+
+    by_patient = defaultdict(lambda: {"gt": 0, "conf": 0.0})
+    for rec in records:
+        p = by_patient[rec["patient_id"]]
+        p["gt"] = max(p["gt"], rec["gt"])
+        p["conf"] = max(p["conf"], rec["conf"])
+
+    best = {"youden_j": float("-inf")}
+    for t in [round(x * 0.05, 2) for x in range(1, 20)]:
+        tp = fp = tn = fn = 0
+        for v in by_patient.values():
+            pred = 1 if v["conf"] >= t else 0
+            if v["gt"] == 1 and pred == 1: tp += 1
+            elif v["gt"] == 0 and pred == 1: fp += 1
+            elif v["gt"] == 0 and pred == 0: tn += 1
+            else: fn += 1
+        sens = tp / (tp + fn) if (tp + fn) else float("nan")
+        spec = tn / (tn + fp) if (tn + fp) else float("nan")
+        acc = (tp + tn) / max(tp + fp + tn + fn, 1)
+        j = (sens + spec - 1) if sens == sens and spec == spec else float("-inf")
+        if j > best["youden_j"]:
+            best = {"threshold": t, "sensitivity": sens, "specificity": spec,
+                    "accuracy": acc, "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+                    "youden_j": j, "n_patients": len(by_patient)}
+    return best
+
+
+# ==== MAIN LOOP ====
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(
+        f"{DATA_PATH} not found. Run:\n"
+        f"  import os; print(os.getcwd()); print(os.path.exists('gc-88pt-4'))\n"
+        f"to find the correct relative path first."
+    )
+
+results_log = {}
+
+for weights, run_name, api_class, batch_size in MODEL_CONFIGS:
+    run_full_name = f"{run_name}_patient_split"
+    best_pt = find_checkpoint(PROJECT_NAME, run_full_name, "best.pt")
+
+    if best_pt:
+        print(f"\n{run_name}: already trained on THIS dataset — found {best_pt}, loading for eval.")
+        model = load_model(best_pt, api_class)
+    else:
+        print(f"\n{'='*60}\nTraining {run_name}\n{'='*60}")
+        reset_gpu()
+        try:
+            model = load_model(weights, api_class)
+            model.train(data=DATA_PATH, batch=batch_size, project=PROJECT_NAME,
+                         name=run_full_name, **TRAIN_ARGS)
+        except Exception as e:
+            print(f"CRASHED: {run_name} - {e}")
+            results_log[run_name] = f"TRAIN_FAILED: {e}"
+            reset_gpu()
+            continue
+
+        best_pt = find_checkpoint(PROJECT_NAME, run_full_name, "best.pt")
+        if best_pt is None:
+            print(f"Training finished but best.pt not found for {run_name} — skipping eval.")
+            results_log[run_name] = "NO_CHECKPOINT"
+            reset_gpu()
+            continue
+        model = load_model(best_pt, api_class)
+
+    print(f"Evaluating {run_name} on gc-88pt-4/valid ...")
+    valid_images = os.path.join(os.path.dirname(DATA_PATH), "valid", "images")
+    valid_labels = os.path.join(os.path.dirname(DATA_PATH), "valid", "labels")
+    try:
+        result = evaluate_presence_absence(model, valid_images, valid_labels)
+        results_log[run_name] = result
+        print(f"  {run_name}: sens={result['sensitivity']:.3f} spec={result['specificity']:.3f} "
+              f"acc={result['accuracy']:.3f} (threshold={result['threshold']}, "
+              f"n_patients={result['n_patients']})")
+    except Exception as e:
+        print(f"Eval failed for {run_name}: {e}")
+        results_log[run_name] = f"EVAL_FAILED: {e}"
+
+    reset_gpu()
+
+# ==== SUMMARY ====
+print(f"\n{'='*60}\nSINGLE-SPLIT RESULTS (gc-88pt-4, valid set)\n{'='*60}")
+for name, result in results_log.items():
+    if isinstance(result, dict):
+        print(f"  {name:12s}: sens={result['sensitivity']:.3f} spec={result['specificity']:.3f} "
+              f"acc={result['accuracy']:.3f}")
+    else:
+        print(f"  {name:12s}: {result}")
+
+os.makedirs(PROJECT_NAME, exist_ok=True)
+with open(os.path.join(PROJECT_NAME, "single_split_summary.json"), "w") as f:
+    json.dump(results_log, f, indent=2)
+print(f"\nSummary written to {PROJECT_NAME}/single_split_summary.json")
