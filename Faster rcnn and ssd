@@ -1,0 +1,323 @@
+# Torchvision Image-Level Model Selection: Pure Tile-Level Test Evaluation
+import os
+import gc
+import yaml
+import torch
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms.functional as F
+from torchvision.models.detection import (
+    fasterrcnn_resnet50_fpn, 
+    FasterRCNN_ResNet50_FPN_Weights,
+    ssd300_vgg16,
+    SSD300_VGG16_Weights
+)
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.ssd import SSDHead
+from sklearn.metrics import confusion_matrix, roc_auc_score
+import warnings
+warnings.filterwarnings("ignore")
+
+# =====================================================
+# CONFIGURATION
+# =====================================================
+PROJECT_ROOT = "./Model_Selection_Run"
+DATASET_YAML = os.path.abspath("./zero_storage_image_split/data.yaml")
+RESULTS_CSV = os.path.join(PROJECT_ROOT, "Model_Selection_Tile_Test_Results_Torchvision.csv")
+
+os.makedirs(PROJECT_ROOT, exist_ok=True)
+
+MODELS_TO_TRAIN = ["Faster_RCNN", "SSD_VGG16"]
+
+EPOCHS = 120
+PATIENCE = 15
+BATCH_SIZE = 8  # Safe batch size for PyTorch models to prevent OOM
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+EVAL_THRESHOLD = 0.50
+
+# =====================================================
+# UTILITY FUNCTIONS
+# =====================================================
+def cleanup():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def find_best_pth(project_root, run_name):
+    """
+    Finds the best.pth for PyTorch models to allow conditional skipping.
+    """
+    search_dir = Path(project_root)
+    candidates = []
+    
+    if search_dir.exists():
+        for p in search_dir.rglob(f"{run_name}_best.pth"):
+            candidates.append(p)
+                
+    if not candidates:
+        return None
+        
+    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return str(candidates[0])
+
+def get_metrics(y_true, y_scores, threshold=EVAL_THRESHOLD):
+    y_pred = (np.array(y_scores) >= threshold).astype(int)
+    y_true = np.array(y_true).astype(int)
+    
+    if len(y_true) == 0:
+        return {}
+        
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    
+    sens = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+    spec = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+    acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan
+    
+    try:
+        auc = roc_auc_score(y_true, y_scores) if len(np.unique(y_true)) > 1 else np.nan
+    except:
+        auc = np.nan
+        
+    return {
+        "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn),
+        "Sensitivity": sens, "Specificity": spec, 
+        "Accuracy": acc, "AUC": auc
+    }
+
+# =====================================================
+# CUSTOM PYTORCH DATASET (PARSES YOLO TXT LISTS)
+# =====================================================
+class YOLODataset(Dataset):
+    def __init__(self, txt_list_path):
+        with open(txt_list_path, "r") as f:
+            self.image_paths = [line.strip() for line in f if line.strip()]
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        width, height = image.size
+
+        # Swap /images/ for /labels/ and .jpg for .txt
+        lbl_path = img_path.replace(os.sep + "images" + os.sep, os.sep + "labels" + os.sep)
+        lbl_path = os.path.splitext(lbl_path)[0] + ".txt"
+
+        boxes = []
+        labels = []
+
+        if os.path.exists(lbl_path):
+            with open(lbl_path, "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        _, cx, cy, w, h = map(float, parts[:5])
+                        
+                        # Convert YOLO [cx, cy, w, h] to Torchvision [xmin, ymin, xmax, ymax]
+                        xmin = (cx - w / 2.0) * width
+                        ymin = (cy - h / 2.0) * height
+                        xmax = (cx + w / 2.0) * width
+                        ymax = (cy + h / 2.0) * height
+                        
+                        if xmax > xmin and ymax > ymin:
+                            boxes.append([xmin, ymin, xmax, ymax])
+                            labels.append(1) # Class 1 = Ganglion Cell (0 is background)
+
+        if len(boxes) > 0:
+            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+            labels = torch.as_tensor(labels, dtype=torch.int64)
+        else:
+            boxes = torch.empty((0, 4), dtype=torch.float32)
+            labels = torch.empty((0,), dtype=torch.int64)
+
+        target = {"boxes": boxes, "labels": labels, "image_id": torch.tensor([idx])}
+        return F.to_tensor(image), target, img_path
+
+def collate_fn(batch):
+    return tuple(zip(*batch))
+
+# =====================================================
+# MODEL INITIALIZATION
+# =====================================================
+def get_torchvision_model(model_name):
+    # num_classes = 2 (1 background + 1 ganglion cell)
+    if model_name == "Faster_RCNN":
+        model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
+        in_features = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes=2)
+    elif model_name == "SSD_VGG16":
+        model = ssd300_vgg16(weights=SSD300_VGG16_Weights.DEFAULT)
+        in_channels = [512, 1024, 512, 256, 256, 256] 
+        num_anchors = model.anchor_generator.num_anchors_per_location()
+        model.head = SSDHead(in_channels, num_anchors, num_classes=2)
+    return model
+
+# =====================================================
+# MAIN PIPELINE
+# =====================================================
+# Parse YAML safely
+with open(DATASET_YAML, "r") as f: 
+    yaml_data = yaml.safe_load(f)
+    
+yaml_dir = os.path.dirname(DATASET_YAML)
+
+train_txt = os.path.join(yaml_dir, yaml_data.get("train", "train.txt"))
+val_txt = os.path.join(yaml_dir, yaml_data.get("val", "val.txt"))
+test_txt = os.path.join(yaml_dir, yaml_data.get("test", "test.txt"))
+
+# Lazy load dataloaders to save RAM
+train_loader = None
+val_loader = None
+all_results = []
+
+for model_name in MODELS_TO_TRAIN:
+    print(f"\n{'='*80}")
+    print(f"PROCESSING: {model_name}")
+    print(f"{'='*80}")
+    
+    # 1. Check if model is already trained
+    best_weights = find_best_pth(PROJECT_ROOT, model_name)
+    
+    if best_weights and os.path.exists(best_weights):
+        print(f"-> CHECKPOINT FOUND: {best_weights}")
+        print("-> Skipping training phase.")
+    else:
+        print(f"-> NO CHECKPOINT FOUND for {model_name}. Starting Training...")
+        
+        if train_loader is None:
+            train_loader = DataLoader(YOLODataset(train_txt), batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, num_workers=4)
+            val_loader = DataLoader(YOLODataset(val_txt), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn, num_workers=4)
+
+        try:
+            model = get_torchvision_model(model_name).to(DEVICE)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.0005)
+            
+            save_path = os.path.join(PROJECT_ROOT, f"{model_name}_best.pth")
+            best_loss = float('inf')
+            patience_counter = 0
+
+            for epoch in range(EPOCHS):
+                model.train()
+                epoch_loss = 0
+                for i, (images, targets, _) in enumerate(train_loader):
+                    images = list(image.to(DEVICE) for image in images)
+                    targets = [{k: v.to(DEVICE) for k, v in t.items()} for t in targets]
+                    
+                    loss_dict = model(images, targets)
+                    losses = sum(loss for loss in loss_dict.values())
+                    
+                    optimizer.zero_grad()
+                    losses.backward()
+                    optimizer.step()
+                    epoch_loss += losses.item()
+                    
+                print(f"Epoch {epoch+1}/{EPOCHS} - Training Loss: {epoch_loss:.4f}")
+                
+                # Validation Loss calculation
+                model.train() # Torchvision models ONLY return losses when in train mode
+                val_loss = 0
+                with torch.no_grad():
+                    for images, targets, _ in val_loader:
+                        images = list(image.to(DEVICE) for image in images)
+                        targets = [{k: v.to(DEVICE) for k, v in t.items()} for t in targets]
+                        
+                        loss_dict = model(images, targets)
+                        val_loss += sum(loss for loss in loss_dict.values()).item()
+                
+                print(f"Epoch {epoch+1}/{EPOCHS} - Validation Loss: {val_loss:.4f}")
+                
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    patience_counter = 0
+                    torch.save(model.state_dict(), save_path)
+                    print(f" -> Saved new best model (Val Loss: {best_loss:.4f})")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= PATIENCE:
+                        print(f"Early stopping triggered at epoch {epoch+1}.")
+                        break
+                        
+            del model
+            cleanup()
+        except Exception as e:
+            print(f"\nCRITICAL: Error training {model_name}: {e}")
+            continue
+
+        best_weights = find_best_pth(PROJECT_ROOT, model_name)
+        if not best_weights or not os.path.exists(best_weights):
+            print(f"CRITICAL: Training concluded but could not locate best.pth for {model_name}")
+            continue
+
+    # =====================================================
+    # 2. EVALUATION ON 20% TEST IMAGES (TILE-LEVEL ONLY)
+    # =====================================================
+    try:
+        print(f"\n-> EVALUATING TEST TILES: {model_name} (Threshold: {EVAL_THRESHOLD})")
+        
+        if not os.path.exists(test_txt):
+            raise FileNotFoundError(f"Missing test file list at: {test_txt}")
+            
+        # Test set loader (workers=1 stops RAM crashing)
+        test_loader = DataLoader(YOLODataset(test_txt), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn, num_workers=1)
+        
+        eval_model = get_torchvision_model(model_name).to(DEVICE)
+        eval_model.load_state_dict(torch.load(best_weights))
+        eval_model.eval() # Switch to evaluation mode to get actual bbox predictions
+
+        tile_scores, tile_gts = [], []
+
+        with torch.no_grad():
+            for i, (images, _, paths) in enumerate(test_loader):
+                images = list(img.to(DEVICE) for img in images)
+                predictions = eval_model(images)
+                
+                for j, pred in enumerate(predictions):
+                    img_path = paths[j]
+                    
+                    # Read ground truth directly from file to verify
+                    lbl_path = img_path.replace(os.sep + "images" + os.sep, os.sep + "labels" + os.sep)
+                    lbl_path = os.path.splitext(lbl_path)[0] + ".txt"
+                    gt = 1 if (os.path.exists(lbl_path) and sum(1 for line in open(lbl_path) if line.strip()) > 0) else 0
+                    
+                    max_conf = 0.0
+                    if len(pred["scores"]) > 0:
+                        max_conf = float(pred["scores"].max().item())
+                        
+                    tile_scores.append(max_conf)
+                    tile_gts.append(gt)
+                    
+                if (i + 1) % (500 // BATCH_SIZE) == 0:  
+                    print(f"Processed {(i + 1) * BATCH_SIZE:,} test tiles...")
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        # Calculate pure tile-level metrics
+        tile_metrics = get_metrics(tile_gts, tile_scores)
+        
+        print(f"\n--- {model_name} TEST TILE RESULTS (N={len(tile_scores):,}) ---")
+        for k, v in tile_metrics.items():
+            print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+            
+        row = {"Model": model_name, "Evaluation_Set": "Test_20_Percent", "Threshold": EVAL_THRESHOLD}
+        row.update(tile_metrics)
+        all_results.append(row)
+        
+        pd.DataFrame(all_results).to_csv(RESULTS_CSV, index=False)
+        print(f"-> Summary saved to: {RESULTS_CSV}")
+
+    except Exception as e:
+        print(f"\nCRITICAL: Error evaluating {model_name}: {e}")
+        
+    finally:
+        try:
+            del eval_model
+        except:
+            pass
+        cleanup()
+
+print(f"\n{'='*80}\nAll test tile evaluations completed. File saved at:\n{RESULTS_CSV}\n{'='*80}")
