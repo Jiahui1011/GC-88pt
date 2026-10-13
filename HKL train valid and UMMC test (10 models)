@@ -1,0 +1,754 @@
+# site split 10 models training 
+import os
+import gc
+import re
+import time
+import yaml
+import random
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.multiprocessing as mp
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+import torchvision.transforms.functional as TF
+from PIL import Image
+from tqdm import tqdm
+
+# Torchvision architectures
+from torchvision.models.detection import (
+    fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights,
+    ssd300_vgg16, SSD300_VGG16_Weights
+)
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.models.detection.ssd import SSDHead
+
+# Ultralytics architectures
+from ultralytics import YOLO, RTDETR
+
+# Metrics
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+from sklearn.metrics import confusion_matrix, roc_auc_score
+
+warnings.filterwarnings("ignore")
+
+# Resolve Linux/PyTorch IPC file descriptor exhaustion
+try:
+    mp.set_sharing_strategy("file_system")
+except Exception:
+    pass
+
+# ================================================================
+# 1. CONFIGURATION
+# ================================================================
+DATASET_YAML = os.path.abspath("./site_split_hkl_ummc/data.yaml")
+PROJECT_ROOT = "./Site_Split_Run"
+OUTPUT_CSV = os.path.join(PROJECT_ROOT, "Final_10_Model_Performance_UMMC_Test.csv")
+
+os.makedirs(PROJECT_ROOT, exist_ok=True)
+
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+DEVICE_ID = 0 if torch.cuda.is_available() else "cpu"
+IMG_SIZE = 640
+CONF_THRESHOLD = 0.50
+DETECTION_IOU_THRESHOLD = 0.50
+
+# --- Training Configurations ---
+ULTRALYTICS_MODELS = [
+    ("YOLOv5mu", "yolov5mu.pt", "yolo"),
+    ("YOLOv8m",  "yolov8m.pt",  "yolo"),
+    ("YOLOv9c",  "yolov9c.pt",  "yolo"),
+    ("YOLOv10m", "yolov10m.pt", "yolo"),
+    ("YOLO11m",  "yolo11m.pt",  "yolo"),
+    ("YOLO26m",  "yolo26m.pt",  "yolo"),
+    ("YOLO12m",  "yolo12m.pt",  "yolo"), 
+    ("RT-DETR-L","rtdetr-l.pt", "rtdetr")
+]
+
+TORCHVISION_MODELS = ["Faster_RCNN", "SSD_VGG16"]
+TV_EPOCHS = 80
+TV_PATIENCE = 15
+TV_BATCH_SIZE = 8
+
+ULTRALYTICS_TRAIN_ARGS = dict(
+    epochs=120, patience=15, imgsz=IMG_SIZE, workers=4, device=DEVICE_ID, exist_ok=True, batch=16,
+    degrees=15.0, fliplr=0.5, flipud=0.5, scale=0.2, translate=0.20,
+    optimizer="AdamW", lr0=0.001, lrf=0.01, weight_decay=0.0005, save=True, seed=42
+)
+
+FINAL_COLUMNS = [
+    "Model", "Level", "Precision", "Recall", "F1 score", "mAP50", "mAP50-95",
+    "Total Training Time", "Total Parameters (M)", "GFLOPs",
+    "Latency (ms/img)", "FPS", "TP", "TN", "FP", "FN",
+    "Sensitivity", "Specificity", "Accuracy", "AUC"
+]
+
+# Generate expected weight paths dynamically
+WEIGHTS = {}
+for name, _, _ in ULTRALYTICS_MODELS:
+    WEIGHTS[name] = os.path.join(PROJECT_ROOT, f"{name}_Baseline", "weights", "best.pt")
+for name in TORCHVISION_MODELS:
+    WEIGHTS[name] = os.path.join(PROJECT_ROOT, f"{name}_optimized_best.pth")
+
+# ================================================================
+# 2. DATASET PARSING & UTILITIES
+# ================================================================
+with open(DATASET_YAML, "r") as f:
+    YAML_DATA = yaml.safe_load(f)
+
+YAML_DIR = os.path.dirname(DATASET_YAML)
+TEST_TXT = os.path.abspath(os.path.join(YAML_DIR, YAML_DATA.get("test", "test.txt")))
+TRAIN_TXT = os.path.abspath(os.path.join(YAML_DIR, YAML_DATA.get("train", "train.txt")))
+VAL_TXT = os.path.abspath(os.path.join(YAML_DIR, YAML_DATA.get("val", "val.txt")))
+
+if not os.path.exists(TEST_TXT):
+    raise FileNotFoundError(f"Could not locate test split file at: {TEST_TXT}")
+
+with open(TEST_TXT, "r") as f:
+    TEST_IMAGES = [line.strip() for line in f if line.strip()]
+
+PATIENT_ID_REGEX = re.compile(r"([A-Za-z]+\d+)HE\d+", re.IGNORECASE)
+def get_patient_id(img_path):
+    fname = os.path.basename(str(img_path))
+    m = PATIENT_ID_REGEX.search(fname)
+    return m.group(1).upper() if m else "UNKNOWN"
+
+def cleanup():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def load_yolo_labels(img_path):
+    label_path = str(img_path).replace(os.sep + "images" + os.sep, os.sep + "labels" + os.sep)
+    label_path = os.path.splitext(label_path)[0] + ".txt"
+    if not os.path.exists(label_path):
+        return torch.empty((0, 4), dtype=torch.float32), torch.empty((0,), dtype=torch.int64)
+
+    image = Image.open(img_path)
+    w, h = image.size
+    boxes, labels = [], []
+    with open(label_path, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 5:
+                _, cx, cy, bw, bh = map(float, parts[:5])
+                x1, y1 = (cx - bw / 2.0) * w, (cy - bh / 2.0) * h
+                x2, y2 = (cx + bw / 2.0) * w, (cy + bh / 2.0) * h
+                if x2 > x1 and y2 > y1:
+                    boxes.append([x1, y1, x2, y2])
+                    labels.append(1)
+
+    if len(boxes) == 0:
+        return torch.empty((0, 4), dtype=torch.float32), torch.empty((0,), dtype=torch.int64)
+    return torch.tensor(boxes, dtype=torch.float32), torch.tensor(labels, dtype=torch.int64)
+
+def has_ground_truth(img_path):
+    boxes, _ = load_yolo_labels(img_path)
+    return len(boxes) > 0
+
+# ================================================================
+# 3. METRICS ENGINES
+# ================================================================
+def calculate_classification_metrics(y_true, y_scores, threshold=CONF_THRESHOLD):
+    y_pred = (np.asarray(y_scores) >= threshold).astype(int)
+    y_true = np.asarray(y_true).astype(int)
+    if len(y_true) == 0:
+        return {k: np.nan for k in ["TP", "TN", "FP", "FN", "Sensitivity", "Specificity", "Accuracy", "AUC"]}
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    sens = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+    spec = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+    acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan
+
+    try:
+        auc = roc_auc_score(y_true, y_scores) if len(np.unique(y_true)) > 1 else np.nan
+    except Exception:
+        auc = np.nan
+
+    return {
+        "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn),
+        "Sensitivity": sens, "Specificity": spec, "Accuracy": acc, "AUC": auc
+    }
+
+def box_iou(boxes1, boxes2):
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return torch.zeros((len(boxes1), len(boxes2)))
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+    lt = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    return inter / (area1[:, None] + area2[None, :] - inter).clamp(min=1e-8)
+
+def detection_precision_recall(predictions, targets, conf_thresh=CONF_THRESHOLD, iou_thresh=DETECTION_IOU_THRESHOLD):
+    TP, FP, FN = 0, 0, 0
+    for pred, target in zip(predictions, targets):
+        pred_boxes, pred_scores = pred["boxes"], pred["scores"]
+        gt_boxes = target["boxes"]
+
+        keep = pred_scores >= conf_thresh
+        pred_boxes, pred_scores = pred_boxes[keep], pred_scores[keep]
+
+        if len(pred_boxes) == 0:
+            FN += len(gt_boxes)
+            continue
+        if len(gt_boxes) == 0:
+            FP += len(pred_boxes)
+            continue
+
+        ious = box_iou(pred_boxes, gt_boxes)
+        matched_gt = set()
+        for pred_idx in torch.argsort(pred_scores, descending=True):
+            best_iou, best_gt = 0.0, -1
+            for gt_idx in range(len(gt_boxes)):
+                if gt_idx in matched_gt: continue
+                iou_val = float(ious[int(pred_idx), gt_idx])
+                if iou_val > best_iou:
+                    best_iou, best_gt = iou_val, gt_idx
+
+            if best_iou >= iou_thresh and best_gt >= 0:
+                TP += 1
+                matched_gt.add(best_gt)
+            else:
+                FP += 1
+        FN += (len(gt_boxes) - len(matched_gt))
+
+    precision = TP / (TP + FP) if TP + FP > 0 else np.nan
+    recall = TP / (TP + FN) if TP + FN > 0 else np.nan
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else np.nan
+    return {"Precision": precision, "Recall": recall, "F1 score": f1}
+
+def get_training_time(weights_path):
+    try:
+        csv_path = Path(weights_path).parent.parent / "results.csv"
+        if csv_path.exists():
+            df = pd.read_csv(csv_path)
+            if "time" in df.columns:
+                return float(pd.to_numeric(df["time"], errors="coerce").dropna().iloc[-1])
+    except Exception:
+        pass
+    return np.nan
+
+# FIXED: Strict isolation to ensure weights are ONLY pulled from the new Site_Split_Run directory.
+# ================================================================
+# UPDATED WEIGHT LOCATOR & TRAINING FUNCTION
+# ================================================================
+def find_best_weights(run_name):
+    # Candidate locations where Ultralytics stores Site_Split_Run
+    search_dirs = [
+        Path(PROJECT_ROOT),
+        Path("./runs/detect/Site_Split_Run"),
+        Path("./runs/detect"),
+        Path("./Jia Hui/runs/detect/Site_Split_Run")
+    ]
+    
+    candidates = []
+    for s_dir in search_dirs:
+        if s_dir.exists():
+            for p in s_dir.rglob("best.pt"):
+                p_str = str(p).lower()
+                # STRICT FILTER: Must belong to Site_Split_Run AND match model name
+                if "site_split_run" in p_str and run_name.lower() in p_str:
+                    candidates.append(p)
+
+    if not candidates:
+        return None
+
+    # Pick the most recently generated best.pt
+    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return str(candidates[0])
+
+
+def train_single_ultralytics(model_name, weights_file, api_class):
+    run_name = f"{model_name}_Baseline"
+    
+    # 1. Check if Site_Split_Run weights already exist
+    existing_weights = find_best_weights(run_name)
+    
+    if existing_weights and os.path.exists(existing_weights):
+        print(f"\n[{model_name}] Found existing weights at: {existing_weights}")
+        print(f"-> Skipping training and updating weight path for evaluation.")
+        WEIGHTS[model_name] = existing_weights
+        return
+
+    print(f"\n{'='*80}\nTRAINING ULTRALYTICS: {model_name}\n{'='*80}")
+    try:
+        current_train_args = ULTRALYTICS_TRAIN_ARGS.copy()
+        if api_class == "rtdetr":
+            current_train_args["batch"] = 10
+            current_train_args["lr0"] = 0.0001
+            current_train_args["lrf"] = 0.01
+        if model_name == "YOLO12m":
+            current_train_args["batch"] = 16
+            current_train_args["workers"] = 2
+
+        model = RTDETR(weights_file) if api_class == "rtdetr" else YOLO(weights_file)
+        model.train(data=DATASET_YAML, project=PROJECT_ROOT, name=run_name, **current_train_args)
+        del model
+        cleanup()
+
+        # 2. Locate the newly produced best.pt
+        new_weights = find_best_weights(run_name)
+        if new_weights:
+            WEIGHTS[model_name] = new_weights
+            print(f"-> Verified new weights saved at: {new_weights}")
+        else:
+            print(f"-> WARNING: Finished training but could not locate new best.pt for {model_name}")
+
+    except Exception as e:
+        print(f"\nError training {model_name}: {e}")
+
+# ================================================================
+# 4. SINGLE MODEL TRAINING PIPELINES
+# ================================================================
+def train_single_ultralytics(model_name, weights_file, api_class):
+    run_name = f"{model_name}_Baseline"
+    
+    # FIXED: Now strictly passing only 1 argument
+    existing_weights = find_best_weights(run_name)
+    
+    if existing_weights and os.path.exists(existing_weights):
+        print(f"[{model_name}] Weights found at {existing_weights}. Skipping training.")
+        WEIGHTS[model_name] = existing_weights
+        return
+        
+    print(f"\n{'='*80}\nTRAINING ULTRALYTICS: {model_name}\n{'='*80}")
+    try:
+        current_train_args = ULTRALYTICS_TRAIN_ARGS.copy()
+        if api_class == "rtdetr":
+            current_train_args["batch"] = 10
+            current_train_args["lr0"] = 0.0001
+            current_train_args["lrf"] = 0.01
+        if model_name == "YOLO12m":
+            current_train_args["batch"] = 16
+            current_train_args["workers"] = 2
+            
+        model = RTDETR(weights_file) if api_class == "rtdetr" else YOLO(weights_file)
+        model.train(data=DATASET_YAML, project=PROJECT_ROOT, name=run_name, **current_train_args)
+        del model
+        cleanup()
+        
+        # FIXED: Now strictly passing only 1 argument
+        WEIGHTS[model_name] = find_best_weights(run_name)
+    except Exception as e:
+        print(f"\nError training {model_name}: {e}")
+
+class SynchronizedYOLODataset(Dataset):
+    def __init__(self, txt_list_path, is_train=True, img_size=640):
+        with open(txt_list_path, "r") as f:
+            self.image_paths = [line.strip() for line in f if line.strip()]
+        self.is_train = is_train
+        self.img_size = img_size
+        self.has_ganglion = [1 if has_ground_truth(p) else 0 for p in self.image_paths]
+
+    def __len__(self): return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        boxes, labels = load_yolo_labels(img_path)
+        orig_w, orig_h = image.size
+
+        image = image.resize((self.img_size, self.img_size), Image.BILINEAR)
+        if len(boxes) > 0:
+            boxes[:, [0, 2]] *= (self.img_size / orig_w)
+            boxes[:, [1, 3]] *= (self.img_size / orig_h)
+            
+            if self.is_train:
+                if random.random() > 0.5:
+                    image = TF.hflip(image)
+                    boxes = torch.tensor([[self.img_size - b[2], b[1], self.img_size - b[0], b[3]] for b in boxes])
+                if random.random() > 0.5:
+                    image = TF.vflip(image)
+                    boxes = torch.tensor([[b[0], self.img_size - b[3], b[2], self.img_size - b[1]] for b in boxes])
+                if random.random() > 0.5:
+                    image = TF.adjust_brightness(image, random.uniform(0.9, 1.1))
+                    image = TF.adjust_contrast(image, random.uniform(0.9, 1.1))
+
+        if len(boxes) > 0:
+            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+            labels = torch.as_tensor(labels, dtype=torch.int64)
+        else:
+            boxes = torch.empty((0, 4), dtype=torch.float32)
+            labels = torch.empty((0,), dtype=torch.int64)
+
+        return TF.to_tensor(image), {"boxes": boxes, "labels": labels, "image_id": torch.tensor([idx])}, img_path
+
+def get_optimized_tv_model(model_name):
+    if model_name == "Faster_RCNN":
+        anchor_generator = AnchorGenerator(sizes=((16,), (32,), (64,), (128,), (256,)), aspect_ratios=((0.5, 1.0, 2.0),) * 5)
+        model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT, rpn_anchor_generator=anchor_generator, min_size=640, max_size=640, box_score_thresh=0.05)
+        in_features = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes=2)
+    elif model_name == "SSD_VGG16":
+        model = ssd300_vgg16(weights=SSD300_VGG16_Weights.DEFAULT)
+        num_anchors = model.anchor_generator.num_anchors_per_location()
+        model.head = SSDHead([512, 1024, 512, 256, 256, 256], num_anchors, num_classes=2)
+    return model
+
+def train_single_torchvision(model_name):
+    save_path = WEIGHTS[model_name]
+    if os.path.exists(save_path):
+        print(f"[{model_name}] Weights found at {save_path}. Skipping training.")
+        return
+        
+    print(f"\n{'='*80}\nTRAINING TORCHVISION: {model_name}\n{'='*80}")
+    
+    train_dataset = SynchronizedYOLODataset(TRAIN_TXT, is_train=True, img_size=IMG_SIZE)
+    val_dataset = SynchronizedYOLODataset(VAL_TXT, is_train=False, img_size=IMG_SIZE)
+
+    weights = [3.0 if has_cell == 1 else 1.0 for has_cell in train_dataset.has_ganglion]
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+    train_loader = DataLoader(train_dataset, batch_size=TV_BATCH_SIZE, sampler=sampler, collate_fn=lambda x: tuple(zip(*x)), num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=TV_BATCH_SIZE, shuffle=False, collate_fn=lambda x: tuple(zip(*x)), num_workers=0)
+
+    model = get_optimized_tv_model(model_name).to(DEVICE)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.005 if model_name == "Faster_RCNN" else 0.001, momentum=0.9, weight_decay=0.0005)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TV_EPOCHS, eta_min=1e-5)
+    scaler = torch.amp.GradScaler('cuda')
+    best_loss = float('inf')
+    patience_counter = 0
+
+    for epoch in range(TV_EPOCHS):
+        model.train()
+        train_loss = 0.0
+        
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{TV_EPOCHS} [Train]")
+        for images, targets, _ in train_pbar:
+            images = list(img.to(DEVICE) for img in images)
+            targets = [{k: v.to(DEVICE) for k, v in t.items()} for t in targets]
+            
+            optimizer.zero_grad()
+            with torch.amp.autocast('cuda'):
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+            
+            scaler.scale(losses).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            scaler.step(optimizer)
+            scaler.update()
+            
+            train_loss += losses.item()
+            train_pbar.set_postfix(loss=f"{losses.item():.4f}")
+            
+        scheduler.step()
+        model.train() 
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, targets, _ in val_loader:
+                images = list(img.to(DEVICE) for img in images)
+                targets = [{k: v.to(DEVICE) for k, v in t.items()} for t in targets]
+                with torch.amp.autocast('cuda'):
+                    loss_dict = model(images, targets)
+                    val_loss += sum(loss for loss in loss_dict.values()).item()
+
+        print(f"Epoch {epoch+1}/{TV_EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        
+        if val_loss < best_loss:
+            best_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), save_path)
+            print(f" -> Saved new best weights ({save_path})")
+        else:
+            patience_counter += 1
+            if patience_counter >= TV_PATIENCE:
+                print(f"Early stopping at epoch {epoch+1}.")
+                break
+    del model
+    cleanup()
+
+# ================================================================
+# 5. EVALUATION MODULES (TILE AND PATIENT LEVEL)
+# ================================================================
+class TorchvisionTestDataset(Dataset):
+    def __init__(self, image_paths, img_size=640):
+        self.image_paths = image_paths
+        self.img_size = img_size
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        boxes, labels = load_yolo_labels(img_path)
+        orig_w, orig_h = image.size
+        
+        image = image.resize((self.img_size, self.img_size), Image.BILINEAR)
+
+        if len(boxes) > 0:
+            boxes[:, [0, 2]] *= (self.img_size / orig_w)
+            boxes[:, [1, 3]] *= (self.img_size / orig_h)
+
+        return TF.to_tensor(image), {"boxes": boxes, "labels": labels, "image_id": torch.tensor([idx])}, img_path
+        
+def eval_ultralytics(model_name, weights_path):
+    is_rtdetr = "RT-DETR" in model_name
+    model = RTDETR(weights_path) if is_rtdetr else YOLO(weights_path)
+
+    params = sum(p.numel() for p in model.model.parameters()) / 1e6 if hasattr(model, "model") else np.nan
+    gflops = np.nan
+    if not is_rtdetr:
+        try:
+            info = model.info(verbose=False)
+            if isinstance(info, tuple) and len(info) >= 2: gflops = float(info[-1])
+        except Exception: pass
+
+    precision, recall, f1, map50, map5095 = np.nan, np.nan, np.nan, np.nan, np.nan
+    val_success = False
+    
+    if not is_rtdetr:
+        try:
+            val_res = model.val(data=DATASET_YAML, split="test", imgsz=IMG_SIZE, device=DEVICE_ID, batch=8, workers=2, verbose=False, plots=False)
+            precision, recall = float(val_res.box.mp), float(val_res.box.mr)
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else np.nan
+            map50, map5095 = float(val_res.box.map50), float(val_res.box.map)
+            val_success = True
+        except Exception as e:
+            print(f"  -> Skipping built-in val() for {model_name}: {e}")
+
+    results = model.predict(source=TEST_TXT, conf=0.001, imgsz=IMG_SIZE, device=DEVICE_ID, stream=True, verbose=False, batch=8)
+
+    tile_scores, tile_gts, inference_times = [], [], []
+    patient_data = {}
+    
+    if not val_success:
+        map_metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox", class_metrics=False)
+        all_preds, all_targets = [], []
+
+    for res in results:
+        if hasattr(res, "speed") and "inference" in res.speed:
+            inference_times.append(res.speed["inference"])
+
+        gt_boxes, gt_labels = load_yolo_labels(res.path)
+        gt = 1 if len(gt_boxes) > 0 else 0
+        max_conf = float(res.boxes.conf.max().item()) if (res.boxes is not None and len(res.boxes) > 0) else 0.0
+
+        tile_scores.append(max_conf)
+        tile_gts.append(gt)
+
+        # Aggregating Patient Level Scores
+        pid = get_patient_id(res.path)
+        if pid not in patient_data:
+            patient_data[pid] = {"score": 0.0, "gt": 0}
+        patient_data[pid]["score"] = max(patient_data[pid]["score"], max_conf)
+        patient_data[pid]["gt"] = max(patient_data[pid]["gt"], gt)
+
+        if not val_success:
+            if res.boxes is not None and len(res.boxes) > 0:
+                pred_boxes = res.boxes.xyxy.cpu()
+                pred_scores = res.boxes.conf.cpu()
+                pred_labels = torch.ones_like(res.boxes.cls.cpu(), dtype=torch.int64)
+            else:
+                pred_boxes = torch.empty((0, 4))
+                pred_scores, pred_labels = torch.empty((0,)), torch.empty((0,), dtype=torch.int64)
+
+            all_preds.append({"boxes": pred_boxes, "scores": pred_scores, "labels": pred_labels})
+            all_targets.append({"boxes": gt_boxes, "labels": gt_labels})
+
+    tile_class_metrics = calculate_classification_metrics(tile_gts, tile_scores)
+    pat_scores = [v["score"] for v in patient_data.values()]
+    pat_gts = [v["gt"] for v in patient_data.values()]
+    pat_class_metrics = calculate_classification_metrics(pat_gts, pat_scores)
+
+    latency = np.mean(inference_times) if len(inference_times) > 0 else np.nan
+    fps = (1000.0 / latency) if (latency and latency > 0) else np.nan
+    train_time = get_training_time(weights_path)
+
+    if not val_success:
+        print(f"  -> Calculating COCO mAP mathematically for {model_name}...")
+        map_metric.update(all_preds, all_targets)
+        map_res = map_metric.compute()
+        map50, map5095 = float(map_res["map_50"]), float(map_res["map"])
+        det_metrics = detection_precision_recall(all_preds, all_targets)
+        precision, recall, f1 = det_metrics["Precision"], det_metrics["Recall"], det_metrics["F1 score"]
+
+    tile_row = {
+        "Model": model_name, "Level": "Tile", "Precision": precision, "Recall": recall, "F1 score": f1,
+        "mAP50": map50, "mAP50-95": map5095, "Total Training Time": train_time, "Total Parameters (M)": params,
+        "GFLOPs": gflops, "Latency (ms/img)": latency, "FPS": fps, **tile_class_metrics
+    }
+    
+    pat_row = {
+        "Model": model_name, "Level": "Patient", "Precision": np.nan, "Recall": np.nan, "F1 score": np.nan,
+        "mAP50": np.nan, "mAP50-95": np.nan, "Total Training Time": train_time, "Total Parameters (M)": params,
+        "GFLOPs": gflops, "Latency (ms/img)": latency, "FPS": fps, **pat_class_metrics
+    }
+
+    return [tile_row, pat_row]
+
+def eval_torchvision(model_name, weights_path):
+    model = get_optimized_tv_model(model_name)
+    model.load_state_dict(torch.load(weights_path, map_location=DEVICE))
+    model.to(DEVICE)
+    model.eval()
+    
+    params = sum(p.numel() for p in model.parameters()) / 1e6
+    gflops = np.nan
+    try:
+        from thop import profile
+        macs, _ = profile(model, inputs=([torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(DEVICE)],), verbose=False)
+        gflops = float((macs * 2) / 1e9)
+    except Exception:
+        pass
+
+    dataloader = DataLoader(TorchvisionTestDataset(TEST_IMAGES, IMG_SIZE), batch_size=8, shuffle=False, num_workers=0, collate_fn=lambda x: tuple(zip(*x)))
+
+    metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox", class_metrics=False)
+    all_preds, all_targets, tile_scores, tile_gts, inference_times = [], [], [], [], []
+    patient_data = {}
+
+    with torch.no_grad():
+        for images, targets, paths in dataloader:
+            images_device = [img.to(DEVICE) for img in images]
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            start = time.perf_counter()
+            predictions = model(images_device)
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            
+            batch_time = (time.perf_counter() - start) * 1000
+            inference_times.extend([batch_time / len(images)] * len(images))
+
+            preds_cpu = [{"boxes": p["boxes"].detach().cpu(), "scores": p["scores"].detach().cpu(), "labels": p["labels"].detach().cpu()} for p in predictions]
+            targets_cpu = [{"boxes": t["boxes"].detach().cpu(), "labels": t["labels"].detach().cpu()} for t in targets]
+
+            metric.update(preds_cpu, targets_cpu)
+            all_preds.extend(preds_cpu)
+            all_targets.extend(targets_cpu)
+
+            for j, p in enumerate(preds_cpu):
+                img_path = paths[j]
+                gt = 1 if len(targets_cpu[j]["boxes"]) > 0 else 0
+                max_conf = float(p["scores"].max().item()) if len(p["scores"]) > 0 else 0.0
+                
+                tile_gts.append(gt)
+                tile_scores.append(max_conf)
+                
+                # Aggregating Patient Level Scores
+                pid = get_patient_id(img_path)
+                if pid not in patient_data:
+                    patient_data[pid] = {"score": 0.0, "gt": 0}
+                patient_data[pid]["score"] = max(patient_data[pid]["score"], max_conf)
+                patient_data[pid]["gt"] = max(patient_data[pid]["gt"], gt)
+
+    map_res = metric.compute()
+    det_metrics = detection_precision_recall(all_preds, all_targets)
+    
+    tile_class_metrics = calculate_classification_metrics(tile_gts, tile_scores)
+    pat_scores = [v["score"] for v in patient_data.values()]
+    pat_gts = [v["gt"] for v in patient_data.values()]
+    pat_class_metrics = calculate_classification_metrics(pat_gts, pat_scores)
+
+    latency = np.mean(inference_times) if len(inference_times) > 0 else np.nan
+    fps = (1000.0 / latency) if (latency and latency > 0) else np.nan
+
+    tile_row = {
+        "Model": model_name, "Level": "Tile", "Precision": det_metrics["Precision"], "Recall": det_metrics["Recall"], "F1 score": det_metrics["F1 score"],
+        "mAP50": float(map_res["map_50"]), "mAP50-95": float(map_res["map"]), "Total Training Time": np.nan, "Total Parameters (M)": params,
+        "GFLOPs": gflops, "Latency (ms/img)": latency, "FPS": fps, **tile_class_metrics
+    }
+    pat_row = {
+        "Model": model_name, "Level": "Patient", "Precision": np.nan, "Recall": np.nan, "F1 score": np.nan,
+        "mAP50": np.nan, "mAP50-95": np.nan, "Total Training Time": np.nan, "Total Parameters (M)": params,
+        "GFLOPs": gflops, "Latency (ms/img)": latency, "FPS": fps, **pat_class_metrics
+    }
+
+    return [tile_row, pat_row]
+
+# ================================================================
+# 6. MAIN EXECUTION PIPELINE
+# ================================================================
+if __name__ == "__main__":
+    print("\n" + "=" * 90)
+    print("STARTING TRAIN -> EVALUATE MASTER PIPELINE (HKL -> UMMC)")
+    print(f"Device: {DEVICE}")
+    print(f"Total Test Images: {len(TEST_IMAGES):,}")
+    print("=" * 90)
+
+    all_results = []
+    
+    # Save a blank CSV right away so it exists
+    pd.DataFrame(columns=FINAL_COLUMNS).to_csv(OUTPUT_CSV, index=False)
+
+    # 1. PROCESS ULTRALYTICS MODELS
+    for model_name, weights_file, api_class in ULTRALYTICS_MODELS:
+        train_single_ultralytics(model_name, weights_file, api_class)
+        
+        weight_path = WEIGHTS.get(model_name)
+        if not weight_path or not os.path.exists(weight_path):
+            print(f"\nCRITICAL ERROR: {model_name} finished training but weights not found at {weight_path}")
+            continue
+            
+        print(f"-> Evaluating {model_name} on UMMC Test Set...")
+        eval_rows = eval_ultralytics(model_name, weight_path)
+        
+        # --- NEW COMPREHENSIVE TERMINAL PRINTING ---
+        print(f"\n✅ {model_name} EVALUATION RESULTS:")
+        for row in eval_rows:
+            lvl = row['Level']
+            # mAP is NaN for patient level, so we format it beautifully to say "N/A"
+            map_str = f"{row.get('mAP50', np.nan):.4f}" if not pd.isna(row.get('mAP50')) else "N/A   "
+            tp, tn = row.get('TP', 0), row.get('TN', 0)
+            fp, fn = row.get('FP', 0), row.get('FN', 0)
+            sens = row.get('Sensitivity', np.nan)
+            spec = row.get('Specificity', np.nan)
+            
+            print(f"   [{lvl:7s}] mAP50: {map_str} | TP: {tp:<5} TN: {tn:<5} FP: {fp:<5} FN: {fn:<5} | Sens: {sens:.4f} | Spec: {spec:.4f}")
+        print("-" * 80)
+        # ------------------------------------------
+
+        for row in eval_rows:
+            filtered_res = {col: row.get(col, np.nan) for col in FINAL_COLUMNS}
+            all_results.append(filtered_res)
+            
+        # Progressively update CSV after each model
+        pd.DataFrame(all_results, columns=FINAL_COLUMNS).to_csv(OUTPUT_CSV, index=False)
+        cleanup()
+
+    # 2. PROCESS TORCHVISION MODELS
+    for model_name in TORCHVISION_MODELS:
+        train_single_torchvision(model_name)
+        
+        weight_path = WEIGHTS.get(model_name)
+        if not weight_path or not os.path.exists(weight_path):
+            print(f"\nCRITICAL ERROR: {model_name} finished training but weights not found at {weight_path}")
+            continue
+            
+        print(f"-> Evaluating {model_name} on UMMC Test Set...")
+        eval_rows = eval_torchvision(model_name, weight_path)
+        
+        # --- NEW COMPREHENSIVE TERMINAL PRINTING ---
+        print(f"\n✅ {model_name} EVALUATION RESULTS:")
+        for row in eval_rows:
+            lvl = row['Level']
+            map_str = f"{row.get('mAP50', np.nan):.4f}" if not pd.isna(row.get('mAP50')) else "N/A   "
+            tp, tn = row.get('TP', 0), row.get('TN', 0)
+            fp, fn = row.get('FP', 0), row.get('FN', 0)
+            sens = row.get('Sensitivity', np.nan)
+            spec = row.get('Specificity', np.nan)
+            
+            print(f"   [{lvl:7s}] mAP50: {map_str} | TP: {tp:<5} TN: {tn:<5} FP: {fp:<5} FN: {fn:<5} | Sens: {sens:.4f} | Spec: {spec:.4f}")
+        print("-" * 80)
+        # ------------------------------------------
+
+        for row in eval_rows:
+            filtered_res = {col: row.get(col, np.nan) for col in FINAL_COLUMNS}
+            all_results.append(filtered_res)
+            
+        # Progressively update CSV after each model
+        pd.DataFrame(all_results, columns=FINAL_COLUMNS).to_csv(OUTPUT_CSV, index=False)
+        cleanup()
+
+    print("\n" + "=" * 120)
+    print("FINAL 10-MODEL PERFORMANCE TABLE (UMMC EXTERNAL TEST)")
+    print("=" * 120)
+    df = pd.read_csv(OUTPUT_CSV)
+    print(df.to_string(index=False))
+    print(f"\nBenchmark completed successfully! Results dynamically written to: {OUTPUT_CSV}")
