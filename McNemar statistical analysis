@@ -1,0 +1,447 @@
+import os
+import itertools
+import numpy as np
+import pandas as pd
+
+from scipy.stats import binom
+from statsmodels.stats.multitest import multipletests
+from sklearn.metrics import confusion_matrix
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+INPUT_CSV = (
+    "./Site_Split_Run/"
+    "Patient_Ganglion_Quantitative_Analysis/"
+    "Individual_Patient_Quantitative_Results.csv"
+)
+
+OUTPUT_DIR = (
+    "./Site_Split_Run/"
+    "Patient_Ganglion_Quantitative_Analysis/"
+    "McNemar_Statistical_Analysis"
+)
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+ALPHA = 0.05
+EXPECTED_PATIENTS = 29
+
+MODELS = [
+    "YOLOv5mu",
+    "YOLOv8m",
+    "YOLOv9c",
+    "YOLOv10m",
+    "YOLO11m",
+    "YOLO12m",
+    "YOLO26m",
+    "RT-DETR-L",
+    "Faster_RCNN",
+    "SSD_VGG16"
+]
+
+RULES = {
+    "At_least_1_image": "Prediction_At_least_1_image",
+    "At_least_2_images": "Prediction_At_least_2_images",
+    "At_least_5_percent": "Prediction_At_least_5_percent"
+}
+
+# ============================================================
+# EXACT McNEMAR AND TWO-SIDED MID-P
+# ============================================================
+
+def mcnemar_pvalues(b, c):
+
+    n = b + c
+
+    if n == 0:
+        return 1.0, 1.0
+
+    k = min(b, c)
+
+    exact_p = min(
+        1.0,
+        2.0 * binom.cdf(k, n, 0.5)
+    )
+
+    mid_p = exact_p - binom.pmf(
+        k, n, 0.5
+    )
+
+    return (
+        float(exact_p),
+        float(np.clip(mid_p, 0.0, 1.0))
+    )
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+df = pd.read_csv(INPUT_CSV)
+
+print("=" * 75)
+print("LOADED DATA")
+print("=" * 75)
+
+print("Total rows:", len(df))
+print("Models:", df["Model"].nunique())
+print("Patients:", df["pid"].nunique())
+
+required_columns = [
+    "pid",
+    "Model",
+    "ganglion_presence_gt",
+    *RULES.values()
+]
+
+missing = [
+    col for col in required_columns
+    if col not in df.columns
+]
+
+if missing:
+    raise ValueError(
+        f"Missing columns: {missing}"
+    )
+
+# ============================================================
+# VALIDATE MODEL AND PATIENT DATA
+# ============================================================
+
+available_models = set(df["Model"].unique())
+
+missing_models = set(MODELS) - available_models
+
+if missing_models:
+    raise ValueError(
+        f"Missing models: {missing_models}"
+    )
+
+df = df[df["Model"].isin(MODELS)].copy()
+
+if df.duplicated(["Model", "pid"]).any():
+    raise ValueError(
+        "Duplicate model-patient combinations detected."
+    )
+
+if df["pid"].nunique() != EXPECTED_PATIENTS:
+    raise ValueError(
+        "Unexpected number of patients."
+    )
+
+for col in [
+    "ganglion_presence_gt",
+    *RULES.values()
+]:
+    if df[col].isna().any():
+        raise ValueError(
+            f"Missing values in {col}"
+        )
+
+    if not df[col].isin([0, 1]).all():
+        raise ValueError(
+            f"{col} must contain only 0 or 1."
+        )
+
+patient_ids = set(df["pid"])
+
+for model in MODELS:
+
+    model_ids = set(
+        df.loc[
+            df["Model"] == model,
+            "pid"
+        ]
+    )
+
+    if model_ids != patient_ids:
+        raise ValueError(
+            f"Patient mismatch for {model}"
+        )
+
+# Ground truth must be identical across models
+gt_consistency = df.groupby(
+    "pid"
+)["ganglion_presence_gt"].nunique()
+
+if (gt_consistency != 1).any():
+    raise ValueError(
+        "Inconsistent patient ground truth."
+    )
+
+reference = df.drop_duplicates(
+    "pid"
+)[["pid", "ganglion_presence_gt"]]
+
+n_positive = int(
+    (reference["ganglion_presence_gt"] == 1).sum()
+)
+
+n_negative = int(
+    (reference["ganglion_presence_gt"] == 0).sum()
+)
+
+print("\nGround-truth distribution:")
+print("Ganglion-present:", n_positive)
+print("Ganglion-absent:", n_negative)
+
+if n_positive != 24 or n_negative != 5:
+    raise ValueError(
+        "Unexpected UMMC specimen distribution."
+    )
+
+# ============================================================
+# ANALYSE EACH DECISION RULE
+# ============================================================
+
+all_performance = []
+all_pairwise = []
+
+for rule_name, prediction_col in RULES.items():
+
+    print("\n" + "=" * 75)
+    print("DECISION RULE:", rule_name)
+    print("=" * 75)
+
+    working = df[
+        [
+            "pid",
+            "Model",
+            "ganglion_presence_gt",
+            prediction_col
+        ]
+    ].copy()
+
+    working = working.rename(
+        columns={
+            "ganglion_presence_gt": "GT",
+            prediction_col: "Prediction"
+        }
+    )
+
+    working["Correct"] = (
+        working["GT"] == working["Prediction"]
+    ).astype(int)
+
+    # --------------------------------------------------------
+    # SPECIMEN-LEVEL PERFORMANCE
+    # --------------------------------------------------------
+
+    for model in MODELS:
+
+        sub = working[
+            working["Model"] == model
+        ]
+
+        tn, fp, fn, tp = confusion_matrix(
+            sub["GT"],
+            sub["Prediction"],
+            labels=[0, 1]
+        ).ravel()
+
+        all_performance.append({
+            "Rule": rule_name,
+            "Model": model,
+            "N": len(sub),
+            "TP": int(tp),
+            "TN": int(tn),
+            "FP": int(fp),
+            "FN": int(fn),
+            "Sensitivity": tp / (tp + fn),
+            "Specificity": tn / (tn + fp),
+            "Accuracy": (tp + tn) / len(sub)
+        })
+
+    # --------------------------------------------------------
+    # PAIRED CORRECTNESS TABLE
+    # --------------------------------------------------------
+
+    wide = working.pivot(
+        index="pid",
+        columns="Model",
+        values="Correct"
+    )
+
+    # --------------------------------------------------------
+    # ALL 45 PAIRWISE COMPARISONS
+    # --------------------------------------------------------
+
+    comparisons = []
+
+    for model_a, model_b in itertools.combinations(
+        MODELS, 2
+    ):
+
+        A = wide[model_a].astype(int)
+        B = wide[model_b].astype(int)
+
+        a = int(
+            ((A == 1) & (B == 1)).sum()
+        )
+
+        b = int(
+            ((A == 1) & (B == 0)).sum()
+        )
+
+        c = int(
+            ((A == 0) & (B == 1)).sum()
+        )
+
+        d = int(
+            ((A == 0) & (B == 0)).sum()
+        )
+
+        exact_p, mid_p = mcnemar_pvalues(
+            b, c
+        )
+
+        comparisons.append({
+            "Rule": rule_name,
+            "Model_A": model_a,
+            "Model_B": model_b,
+            "a": a,
+            "b": b,
+            "c": c,
+            "d": d,
+            "Discordant_N": b + c,
+            "Exact_P": exact_p,
+            "Mid_P": mid_p,
+            "Accuracy_Difference": (
+                b - c
+            ) / EXPECTED_PATIENTS
+        })
+
+    comparison_df = pd.DataFrame(
+        comparisons
+    )
+
+    # --------------------------------------------------------
+    # HOLM-BONFERRONI CORRECTION
+    # --------------------------------------------------------
+
+    for p_col in ["Exact_P", "Mid_P"]:
+
+        reject, adjusted_p, _, _ = multipletests(
+            comparison_df[p_col].values,
+            alpha=ALPHA,
+            method="holm"
+        )
+
+        comparison_df[
+            p_col + "_Holm"
+        ] = adjusted_p
+
+        comparison_df[
+            p_col + "_Significant_Holm"
+        ] = reject
+
+    all_pairwise.append(comparison_df)
+
+    # --------------------------------------------------------
+    # PRINT RULE SUMMARY
+    # --------------------------------------------------------
+
+    print(
+        "Total comparisons:",
+        len(comparison_df)
+    )
+
+    print(
+        "Unadjusted mid-p significant:",
+        int(
+            (comparison_df["Mid_P"] < ALPHA).sum()
+        )
+    )
+
+    print(
+        "Holm-adjusted mid-p significant:",
+        int(
+            (
+                comparison_df["Mid_P_Holm"]
+                < ALPHA
+            ).sum()
+        )
+    )
+
+# ============================================================
+# COMBINE RESULTS
+# ============================================================
+
+performance_df = pd.DataFrame(
+    all_performance
+)
+
+pairwise_df = pd.concat(
+    all_pairwise,
+    ignore_index=True
+)
+
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
+performance_path = os.path.join(
+    OUTPUT_DIR,
+    "Specimen_Level_Performance_All_Rules.csv"
+)
+
+pairwise_path = os.path.join(
+    OUTPUT_DIR,
+    "McNemar_All_45_Pairs_All_Rules.csv"
+)
+
+performance_df.to_csv(
+    performance_path,
+    index=False
+)
+
+pairwise_df.to_csv(
+    pairwise_path,
+    index=False
+)
+
+# ============================================================
+# MAIN RULE RESULTS
+# ============================================================
+
+main_rule = pairwise_df[
+    pairwise_df["Rule"] == "At_least_1_image"
+].copy()
+
+main_rule = main_rule.sort_values(
+    "Mid_P"
+)
+
+main_rule.to_csv(
+    os.path.join(
+        OUTPUT_DIR,
+        "MAIN_McNemar_At_Least_1_Tile.csv"
+    ),
+    index=False
+)
+
+print("\n" + "=" * 75)
+print("MAIN ANALYSIS: >=1 POSITIVE TILE")
+print("=" * 75)
+
+print(
+    main_rule[
+        [
+            "Model_A",
+            "Model_B",
+            "b",
+            "c",
+            "Exact_P",
+            "Mid_P",
+            "Mid_P_Holm"
+        ]
+    ].to_string(
+        index=False,
+        float_format=lambda x: f"{x:.4f}"
+    )
+)
+
+print("\nAnalysis completed.")
+print("Results saved to:", OUTPUT_DIR)
