@@ -1,0 +1,197 @@
+import numpy as np
+import pandas as pd
+from sklearn.metrics import roc_auc_score
+from pathlib import Path
+
+# =====================================================
+# CONFIGURATION
+# =====================================================
+
+SCORE_DIR = Path("Site_Split_Run/Tile_AUROC_Analysis/tile_scores")
+
+OUTPUT_CSV = Path(
+    "Site_Split_Run/Tile_AUROC_Analysis/AUROC_95CI.csv"
+)
+
+MODELS = [
+    "YOLOv5mu",
+    "YOLOv8m",
+    "YOLOv9c",
+    "YOLOv10m",
+    "YOLO11m",
+    "YOLO12m",
+    "YOLO26m",
+    "RT-DETR-L",
+    "Faster R-CNN",
+    "SSD-VGG16"
+]
+
+DATASETS = {
+    "HKL_internal_validation": "val",
+    "UMMC_external_test": "test"
+}
+
+N_BOOTSTRAP = 5000
+SEED = 42
+
+
+# =====================================================
+# PATIENT-LEVEL CLUSTER BOOTSTRAP
+# =====================================================
+
+def bootstrap_auc_ci(df, n_bootstrap=5000, seed=42):
+
+    rng = np.random.default_rng(seed)
+
+    y_true = df["y_true"].to_numpy()
+    y_score = df["y_score"].to_numpy()
+
+    auc_original = roc_auc_score(y_true, y_score)
+
+    # Group tile indices by patient
+    patient_groups = [
+        group.index.to_numpy()
+        for _, group in df.reset_index(drop=True).groupby("patient_id")
+    ]
+
+    n_patients = len(patient_groups)
+
+    bootstrap_aucs = []
+
+    for _ in range(n_bootstrap):
+
+        sampled_patients = rng.integers(
+            0,
+            n_patients,
+            size=n_patients
+        )
+
+        sampled_indices = np.concatenate([
+            patient_groups[i]
+            for i in sampled_patients
+        ])
+
+        boot_true = y_true[sampled_indices]
+        boot_score = y_score[sampled_indices]
+
+        # AUROC requires both positive and negative tiles
+        if len(np.unique(boot_true)) < 2:
+            continue
+
+        auc = roc_auc_score(
+            boot_true,
+            boot_score
+        )
+
+        bootstrap_aucs.append(auc)
+
+    bootstrap_aucs = np.asarray(bootstrap_aucs)
+
+    if len(bootstrap_aucs) == 0:
+        raise RuntimeError(
+            "No valid bootstrap samples contained both classes."
+        )
+
+    ci_lower = np.percentile(bootstrap_aucs, 2.5)
+    ci_upper = np.percentile(bootstrap_aucs, 97.5)
+
+    return {
+        "AUROC": auc_original,
+        "CI_lower": ci_lower,
+        "CI_upper": ci_upper,
+        "N_patients": n_patients,
+        "N_images": len(df),
+        "Valid_bootstraps": len(bootstrap_aucs)
+    }
+
+
+# =====================================================
+# MAIN ANALYSIS
+# =====================================================
+
+results = []
+
+for model in MODELS:
+
+    for dataset_name, suffix in DATASETS.items():
+# Handle Faster R-CNN filename convention
+        file_model = "Faster_R-CNN" if model == "Faster R-CNN" else model
+
+        csv_path = SCORE_DIR / f"{file_model}_{suffix}.csv"
+        if not csv_path.exists():
+            print(f"Missing: {csv_path}")
+            continue
+
+        df = pd.read_csv(csv_path)
+
+        # Standardise column names
+        df = df.rename(columns={
+            "patient": "patient_id",
+            "gt": "y_true",
+            "score": "y_score"
+        })
+
+        required = {"patient_id", "y_true", "y_score"}
+
+        if not required.issubset(df.columns):
+            raise ValueError(
+                f"{csv_path} must contain: {required}"
+            )
+
+        # Validate patient identifiers
+        if df["patient_id"].isna().any():
+            raise ValueError(
+                f"Missing patient identifiers in {csv_path}"
+            )
+
+        # Calculate patient-clustered AUROC confidence interval
+        result = bootstrap_auc_ci(
+            df,
+            n_bootstrap=N_BOOTSTRAP,
+            seed=SEED
+        )
+
+        results.append({
+            "Model": model,
+            "Dataset": dataset_name,
+            **result
+        })
+
+        print(
+            f"{model:15s} | "
+            f"{dataset_name:25s} | "
+            f"Patients {result['N_patients']:2d} | "
+            f"AUROC {result['AUROC']:.4f} "
+            f"(95% CI "
+            f"{result['CI_lower']:.4f}–"
+            f"{result['CI_upper']:.4f}) | "
+            f"Valid bootstrap samples: "
+            f"{result['Valid_bootstraps']}"
+        )
+
+# =====================================================
+# EXPORT
+# =====================================================
+
+results_df = pd.DataFrame(results)
+
+results_df["AUROC_95CI"] = results_df.apply(
+    lambda row: (
+        f"{row['AUROC']:.3f} "
+        f"({row['CI_lower']:.3f}–"
+        f"{row['CI_upper']:.3f})"
+    ),
+    axis=1
+)
+
+OUTPUT_CSV.parent.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+results_df.to_csv(
+    OUTPUT_CSV,
+    index=False
+)
+
+print("\nSaved:", OUTPUT_CSV)
