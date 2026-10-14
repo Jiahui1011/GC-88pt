@@ -1,0 +1,381 @@
+"""Standardised bounding-box evaluation (HKL val + UMMC test) and specimen CIs.
+
+Run from the project root. Requires ultralytics, torchvision, torchmetrics,
+pycocotools, scipy, pandas, PyYAML, Pillow, tqdm.
+
+Specimen-level counts are the previously supplied UMMC 29-specimen results;
+these are NOT recomputed from bounding-box counts. To replace them with
+updated specimen results, edit SPECIMEN_COUNTS or load an exported CSV.
+"""
+import gc
+import json
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torchvision.transforms.functional as TF
+import yaml
+from PIL import Image
+from scipy.stats import binomtest
+from tqdm.auto import tqdm
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, ssd300_vgg16
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.models.detection.ssd import SSDHead
+from torchvision.ops import box_iou
+from ultralytics import YOLO, RTDETR
+
+warnings.filterwarnings('ignore', category=UserWarning)
+
+PROJECT_ROOT = Path('./Site_Split_Run')
+DATASET_YAML = Path('./site_split_hkl_ummc/data.yaml').resolve()
+OUTPUT_DIR = PROJECT_ROOT / 'Standardized_BBox_Evaluation'
+SPLITS = ('val', 'test')  # HKL validation, UMMC external test
+IMG_SIZE = 640
+FIXED_CONF = 0.50
+AP_MIN_CONF = 0.001
+MATCH_IOU = 0.50
+MAX_DET = 100
+BATCH_SIZE = 8
+DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+# Reuse results if already computed. Set True to recalculate all splits/models.
+FORCE_REEVALUATE = False
+
+MODEL_PATHS = {
+    'YOLOv5mu': PROJECT_ROOT / 'YOLOv5mu_Baseline/weights/best.pt',
+    'YOLOv8m': PROJECT_ROOT / 'YOLOv8m_Baseline/weights/best.pt',
+    'YOLOv9c': PROJECT_ROOT / 'YOLOv9c_Baseline/weights/best.pt',
+    'YOLOv10m': PROJECT_ROOT / 'YOLOv10m_Baseline/weights/best.pt',
+    'YOLO11m': PROJECT_ROOT / 'YOLO11m_Baseline/weights/best.pt',
+    'YOLO12m': PROJECT_ROOT / 'YOLO12m_Baseline/weights/best.pt',
+    'YOLO26m': PROJECT_ROOT / 'YOLO26m_Baseline/weights/best.pt',
+    'RT-DETR-L': PROJECT_ROOT / 'RT-DETR-L_Baseline/weights/best.pt',
+    'Faster_RCNN': PROJECT_ROOT / 'Faster_RCNN_optimized_best.pth',
+    'SSD_VGG16': PROJECT_ROOT / 'SSD_VGG16_optimized_best.pth',
+}
+
+# Previously supplied UMMC specimen-level results: (TP out of 24, TN out of 5)
+# The >=5% decision rule is exploratory; no thresholds are optimised here.
+SPECIMEN_COUNTS = {
+    'YOLOv5mu': [(24, 3), (24, 4), (24, 4)],
+    'YOLOv8m': [(24, 4), (24, 5), (24, 5)],
+    'YOLOv9c': [(24, 4), (24, 4), (24, 4)],
+    'YOLOv10m': [(24, 5), (24, 5), (24, 5)],
+    'YOLO11m': [(24, 5), (24, 5), (24, 5)],
+    'YOLO12m': [(24, 3), (24, 5), (24, 4)],
+    'YOLO26m': [(24, 4), (24, 5), (24, 5)],
+    'RT-DETR-L': [(24, 0), (24, 2), (24, 2)],
+    'Faster_RCNN': [(24, 0), (24, 0), (24, 0)],
+    'SSD_VGG16': [(23, 1), (23, 3), (22, 4)],
+}
+RULE_NAMES = ('at_least_1_positive_tile', 'at_least_2_positive_tiles', 'at_least_5_percent_positive_tiles')
+N_POS, N_NEG = 24, 5
+
+
+def label_path_for(image_path):
+    parts = list(image_path.parts)
+    for idx in reversed(range(len(parts))):
+        if parts[idx].lower() == 'images':
+            parts[idx] = 'labels'
+            return Path(*parts).with_suffix('.txt')
+    raise ValueError(f'No images directory in path: {image_path}')
+
+
+def resolve_split_paths(split):
+    with DATASET_YAML.open() as f:
+        data = yaml.safe_load(f)
+    value = data.get(split)
+    if value is None:
+        raise KeyError(f'{split} missing from {DATASET_YAML}')
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = DATASET_YAML.parent / candidate
+    candidate = candidate.resolve()
+    if candidate.is_file() and candidate.suffix.lower() == '.txt':
+        paths = []
+        for line in candidate.read_text().splitlines():
+            raw = line.strip()
+            if not raw:
+                continue
+            p = Path(raw)
+            if not p.is_absolute():
+                if p.exists():
+                    p = p.resolve()
+                else:
+                    p = (DATASET_YAML.parent / p).resolve()
+            if not p.is_file():
+                raise FileNotFoundError(f'Image not found: {p}')
+            paths.append(p)
+    elif candidate.is_dir():
+        paths = [p.resolve() for p in candidate.rglob('*') if p.suffix.lower() in ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp')]
+    else:
+        raise FileNotFoundError(f'Expected split text file or directory: {candidate}')
+    return sorted(set(paths))
+
+
+def read_gt(path, width, height):
+    boxes = []
+    label_path = label_path_for(path)
+    if label_path.is_file():
+        for line in label_path.read_text().splitlines():
+            cols = line.split()
+            if len(cols) < 5:
+                continue
+            cls, xc, yc, bw, bh = map(float, cols[:5])
+            if int(cls) != 0:
+                raise ValueError(f'Unexpected class {cls} in {label_path}; this script expects one class, id 0.')
+            x0, x1 = np.clip([(xc-bw/2)*width, (xc+bw/2)*width], 0, width)
+            y0, y1 = np.clip([(yc-bh/2)*height, (yc+bh/2)*height], 0, height)
+            if x1 > x0 and y1 > y0:
+                boxes.append([x0, y0, x1, y1])
+    return {'boxes': torch.tensor(boxes, dtype=torch.float32).reshape(-1, 4),
+            'labels': torch.zeros(len(boxes), dtype=torch.int64)}
+
+
+def prepare_pred(boxes, scores, width, height):
+    boxes = torch.as_tensor(boxes, dtype=torch.float32).cpu().reshape(-1, 4).clone()
+    scores = torch.as_tensor(scores, dtype=torch.float32).cpu().reshape(-1)
+    valid = torch.isfinite(scores) & torch.isfinite(boxes).all(dim=1)
+    boxes, scores = boxes[valid], scores[valid]
+    boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, width)
+    boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, height)
+    valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1]) & (scores >= AP_MIN_CONF)
+    boxes, scores = boxes[valid], scores[valid]
+    order = torch.argsort(scores, descending=True)[:MAX_DET]
+    return {'boxes': boxes[order], 'scores': scores[order],
+            'labels': torch.zeros(len(order), dtype=torch.int64)}
+
+
+def match_image(pred, gt):
+    keep = pred['scores'] >= FIXED_CONF
+    pb, ps = pred['boxes'][keep], pred['scores'][keep]
+    gb = gt['boxes']
+    if len(pb) == 0:
+        return 0, 0, len(gb)
+    if len(gb) == 0:
+        return 0, len(pb), 0
+    ious = box_iou(pb, gb)
+    matched = set()
+    tp = fp = 0
+    for j in torch.argsort(ps, descending=True).tolist():
+        candidates = [(float(ious[j, k]), k) for k in range(len(gb)) if k not in matched]
+        if candidates:
+            value, k = max(candidates)
+            if value >= MATCH_IOU:
+                matched.add(k)
+                tp += 1
+                continue
+        fp += 1
+    return tp, fp, len(gb) - len(matched)
+
+
+def create_torchvision(name):
+    if name == 'Faster_RCNN':
+        ag = AnchorGenerator(sizes=((16,), (32,), (64,), (128,), (256,)),
+                             aspect_ratios=((0.5, 1.0, 2.0),) * 5)
+        model = fasterrcnn_resnet50_fpn(
+            weights=None, weights_backbone=None,
+            rpn_anchor_generator=ag, min_size=640, max_size=640,
+            box_score_thresh=AP_MIN_CONF, box_detections_per_img=MAX_DET)
+        n = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(n, 2)
+        model.roi_heads.score_thresh = AP_MIN_CONF
+        model.roi_heads.detections_per_img = MAX_DET
+    elif name == 'SSD_VGG16':
+        model = ssd300_vgg16(weights=None, weights_backbone=None)
+        anchors = model.anchor_generator.num_anchors_per_location()
+        model.head = SSDHead([512, 1024, 512, 256, 256, 256], anchors, num_classes=2)
+        model.score_thresh = AP_MIN_CONF
+        model.detections_per_img = MAX_DET
+    else:
+        raise ValueError(name)
+    state = torch.load(MODEL_PATHS[name], map_location='cpu', weights_only=True)
+    model.load_state_dict(state, strict=True)
+    return model.to(DEVICE).eval()
+
+
+def batches(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i+size]
+
+
+def run_model(name, split, image_paths):
+    weights = MODEL_PATHS[name]
+    if not weights.is_file():
+        raise FileNotFoundError(f'{name} checkpoint missing: {weights}')
+    is_tv = name in ('Faster_RCNN', 'SSD_VGG16')
+    model = create_torchvision(name) if is_tv else (RTDETR(str(weights)) if name == 'RT-DETR-L' else YOLO(str(weights)))
+    ap = MeanAveragePrecision(
+        box_format='xyxy', iou_type='bbox',
+        iou_thresholds=np.arange(0.50, 1.00, 0.05).tolist(),
+        max_detection_thresholds=[1, 10, MAX_DET],
+        class_metrics=False, backend='pycocotools')
+    tp_sum = fp_sum = fn_sum = n_gt = n_pred = 0
+    per_image = []
+    start = time.perf_counter()
+    try:
+        for chunk in tqdm(batches(image_paths, BATCH_SIZE), total=(len(image_paths)+BATCH_SIZE-1)//BATCH_SIZE, desc=f'{name} {split}'):
+            sizes, targets, tensors = [], [], []
+            for path in chunk:
+                with Image.open(path) as im:
+                    w, h = im.size
+                    sizes.append((w, h))
+                    targets.append(read_gt(path, w, h))
+                    if is_tv:
+                        im_resized = im.convert('RGB').resize((IMG_SIZE, IMG_SIZE), Image.Resampling.BILINEAR)
+                        tensors.append(TF.to_tensor(im_resized))
+            if is_tv:
+                with torch.inference_mode():
+                    raw_preds = model([t.to(DEVICE) for t in tensors])
+                preds = []
+                for raw, (w, h) in zip(raw_preds, sizes):
+                    keep = raw['labels'].detach().cpu() == 1
+                    boxes = raw['boxes'].detach().cpu()[keep].clone()
+                    scores = raw['scores'].detach().cpu()[keep]
+                    boxes[:, [0, 2]] *= w / IMG_SIZE
+                    boxes[:, [1, 3]] *= h / IMG_SIZE
+                    preds.append(prepare_pred(boxes, scores, w, h))
+                del raw_preds, tensors
+            else:
+                raw_preds = model.predict(
+                    source=[str(p) for p in chunk], imgsz=IMG_SIZE,
+                    conf=AP_MIN_CONF, iou=0.70, max_det=MAX_DET,
+                    device=0 if DEVICE.type == 'cuda' else 'cpu',
+                    verbose=False, batch=len(chunk))
+                preds = []
+                for raw, (w, h) in zip(raw_preds, sizes):
+                    if raw.boxes is None:
+                        boxes, scores = torch.empty((0, 4)), torch.empty(0)
+                    else:
+                        boxes = raw.boxes.xyxy.detach().cpu()
+                        scores = raw.boxes.conf.detach().cpu()
+                    preds.append(prepare_pred(boxes, scores, w, h))
+                del raw_preds
+            ap.update(preds, targets)
+            for path, pred, gt in zip(chunk, preds, targets):
+                tp, fp, fn = match_image(pred, gt)
+                tp_sum += tp
+                fp_sum += fp
+                fn_sum += fn
+                n_gt += len(gt['boxes'])
+                n_fixed = int((pred['scores'] >= FIXED_CONF).sum())
+                n_pred += n_fixed
+                per_image.append({'Model': name, 'Dataset': split, 'Image': str(path),
+                                  'GT_boxes': len(gt['boxes']), 'Pred_boxes_conf_0.5': n_fixed,
+                                  'Box_TP': tp, 'Box_FP': fp, 'Box_FN': fn})
+        metrics = ap.compute()
+        precision = tp_sum/(tp_sum+fp_sum) if tp_sum+fp_sum else float('nan')
+        recall = tp_sum/(tp_sum+fn_sum) if tp_sum+fn_sum else float('nan')
+        f1 = 2*precision*recall/(precision+recall) if precision+recall else float('nan')
+        return ({'Model': name, 'Dataset': split, 'N_images': len(image_paths),
+                 'Box_Precision_at_conf0.50_IoU0.50': precision,
+                 'Box_Recall_at_conf0.50_IoU0.50': recall,
+                 'Box_F1_at_conf0.50_IoU0.50': f1,
+                 'mAP50': float(metrics['map_50']), 'mAP50_95': float(metrics['map']),
+                 'Box_TP': tp_sum, 'Box_FP': fp_sum, 'Box_FN': fn_sum,
+                 'GT_boxes': n_gt, 'Pred_boxes_conf0.50': n_pred,
+                 'Evaluation_seconds': round(time.perf_counter()-start, 1)}, per_image)
+    finally:
+        del model, ap
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def exact_binomial_ci(success, total, level=0.95):
+    ci = binomtest(int(success), int(total)).proportion_ci(confidence_level=level, method='exact')
+    return success / total, ci.low, ci.high
+
+
+def generate_specimen_ci():
+    records = []
+    for model, counts in SPECIMEN_COUNTS.items():
+        for rule, (tp, tn) in zip(RULE_NAMES, counts):
+            fn = N_POS - tp
+            fp = N_NEG - tn
+            rec = {'Model': model, 'Decision_rule': rule, 'N_specimens': N_POS+N_NEG,
+                   'Ganglion_present': N_POS, 'Ganglion_absent': N_NEG,
+                   'TP': tp, 'TN': tn, 'FP': fp, 'FN': fn}
+            for key, numerator, denominator in (
+                ('Sensitivity', tp, N_POS), ('Specificity', tn, N_NEG),
+                ('Accuracy', tp+tn, N_POS+N_NEG)):
+                est, lo, hi = exact_binomial_ci(numerator, denominator)
+                rec[key] = est
+                rec[key+'_CI95_lower'] = lo
+                rec[key+'_CI95_upper'] = hi
+                rec[key+'_formatted'] = f'{est*100:.1f}% ({lo*100:.1f}–{hi*100:.1f}%)'
+            records.append(rec)
+    df = pd.DataFrame(records)
+    df.to_csv(OUTPUT_DIR / 'Specimen_Level_Exact_95CI_All_Three_Rules.csv', index=False)
+    df[df['Decision_rule'] == 'at_least_5_percent_positive_tiles'].to_csv(
+        OUTPUT_DIR / 'Specimen_Level_Exact_95CI_5percent_Rule.csv', index=False)
+    print('\nSpecimen-level exact 95% CIs (5% rule):')
+    print(df.loc[df['Decision_rule'] == 'at_least_5_percent_positive_tiles',
+                 ['Model', 'Sensitivity_formatted', 'Specificity_formatted', 'Accuracy_formatted']].to_string(index=False))
+    return df
+
+
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    generate_specimen_ci()  # independent of model inference; always generated
+    all_results = []
+    for split in SPLITS:
+        paths = resolve_split_paths(split)
+        print(f'\n{split.upper()}: {len(paths):,} images, device={DEVICE}')
+        summary_file = OUTPUT_DIR / f'Standardized_BBox_Evaluation_{split}.csv'
+        per_image_file = OUTPUT_DIR / f'Standardized_BBox_Evaluation_{split}_per_image.csv'
+        if not FORCE_REEVALUATE and summary_file.exists():
+            existing = pd.read_csv(summary_file)
+            if 'Model' not in existing.columns or 'Dataset' not in existing.columns:
+                raise ValueError(f'Invalid existing CSV: {summary_file}')
+            if not set(existing['Dataset'].astype(str)).issubset({split}):
+                raise ValueError(f'Dataset mismatch in {summary_file}')
+            if not set(existing['N_images'].astype(int)).issubset({len(paths)}):
+                raise ValueError(f'Image count mismatch in {summary_file}')
+            results = existing.to_dict('records')
+            print(f'Resuming {len(results)} existing model result(s) from {summary_file}')
+        else:
+            results = []
+        completed = {r['Model'] for r in results}
+        for name in MODEL_PATHS:
+            if name in completed:
+                print(f'Skipping {name} ({split}): existing result')
+                continue
+            print(f'\nEvaluating {name} on {split}...')
+            row, image_rows = run_model(name, split, paths)
+            results.append(row)
+            pd.DataFrame(results).to_csv(summary_file, index=False)
+            pd.DataFrame(image_rows).to_csv(
+                per_image_file, index=False,
+                mode='a' if per_image_file.exists() and not FORCE_REEVALUATE else 'w',
+                header=not (per_image_file.exists() and not FORCE_REEVALUATE))
+            print(pd.DataFrame([row]).to_string(index=False))
+        all_results.extend(results)
+    combined = pd.DataFrame(all_results)
+    combined.to_csv(OUTPUT_DIR / 'Standardized_BBox_HKL_UMMC_Combined.csv', index=False)
+    pivot = combined.pivot_table(index='Model', columns='Dataset',
+                                 values=['Box_Precision_at_conf0.50_IoU0.50',
+                                         'Box_Recall_at_conf0.50_IoU0.50',
+                                         'Box_F1_at_conf0.50_IoU0.50', 'mAP50', 'mAP50_95'],
+                                 aggfunc='first')
+    pivot.columns = [f'{metric}_{split}' for metric, split in pivot.columns]
+    for metric in ('mAP50', 'mAP50_95'):
+        if f'{metric}_test' in pivot and f'{metric}_val' in pivot:
+            pivot[f'{metric}_delta_test_minus_val'] = pivot[f'{metric}_test'] - pivot[f'{metric}_val']
+    pivot.reset_index().to_csv(OUTPUT_DIR / 'Standardized_BBox_Internal_vs_External.csv', index=False)
+    metadata = {'splits': list(SPLITS), 'img_size': IMG_SIZE, 'fixed_conf': FIXED_CONF,
+                'ap_min_conf': AP_MIN_CONF, 'match_iou': MATCH_IOU,
+                'max_detections': MAX_DET, 'device': str(DEVICE),
+                'specimen_counts_source': 'previously supplied UMMC specimen-level table, not recomputed',
+                'specimen_ci_method': 'Clopper-Pearson exact binomial',
+                'specimen_ci_caution': 'Assumes independent specimens; multiple specimens per patient require cluster-aware inference.'}
+    (OUTPUT_DIR / 'Evaluation_Metadata.json').write_text(json.dumps(metadata, indent=2))
+    print(f'\nFinished. Outputs: {OUTPUT_DIR.resolve()}')
+
+
+if __name__ == '__main__':
+    main()
