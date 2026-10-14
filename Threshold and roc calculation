@@ -1,0 +1,264 @@
+#Threshold and roc calculation 
+import os
+import gc
+import re
+import yaml
+import warnings
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from PIL import Image
+from sklearn.metrics import roc_curve, auc, confusion_matrix
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms.functional as TF
+
+from ultralytics import YOLO, RTDETR
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, ssd300_vgg16
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.models.detection.ssd import SSDHead
+
+warnings.filterwarnings("ignore")
+
+# ================================================================
+# 1. CONFIGURATION
+# ================================================================
+PROJECT_ROOT = "./Site_Split_Run"
+DATASET_YAML = os.path.abspath("./site_split_hkl_ummc/data.yaml")
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Threshold_Analytics")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+DEVICE_ID = 0 if torch.cuda.is_available() else "cpu"
+IMG_SIZE = 640
+TV_BATCH_SIZE = 4      # Safe for Faster R-CNN VRAM
+MIN_CONF_THRESH = 0.05  # Drops 99% of background noise to save RAM
+THRESHOLDS = np.round(np.arange(0.1, 0.95, 0.05), 2)
+
+MODELS = [
+    ("YOLOv5mu", "yolo"), ("YOLOv8m", "yolo"), ("YOLOv9c", "yolo"),
+    ("YOLOv10m", "yolo"), ("YOLO11m", "yolo"), ("YOLO12m", "yolo"),
+    ("YOLO26m", "yolo"), ("RT-DETR-L", "rtdetr"),
+    ("Faster_RCNN", "tv"), ("SSD_VGG16", "tv")
+]
+
+SUMMARY_CSV = os.path.join(OUTPUT_DIR, "Threshold_Optimization_Results.csv")
+SCORES_CACHE_DIR = os.path.join(OUTPUT_DIR, "cache_scores")
+os.makedirs(SCORES_CACHE_DIR, exist_ok=True)
+
+with open(DATASET_YAML, "r") as f:
+    YAML_DATA = yaml.safe_load(f)
+
+YAML_DIR = os.path.dirname(DATASET_YAML)
+VAL_TXT = os.path.abspath(os.path.join(YAML_DIR, YAML_DATA.get("val", "val.txt")))
+TEST_TXT = os.path.abspath(os.path.join(YAML_DIR, YAML_DATA.get("test", "test.txt")))
+
+# ================================================================
+# 2. UTILITIES
+# ================================================================
+PATIENT_ID_REGEX = re.compile(r"([A-Za-z]+\d+)HE\d+", re.IGNORECASE)
+
+def get_patient_id(img_path):
+    m = PATIENT_ID_REGEX.search(os.path.basename(str(img_path)))
+    return m.group(1).upper() if m else "UNKNOWN"
+
+def get_gt_label(img_path):
+    lbl_path = str(img_path).replace(os.sep + "images" + os.sep, os.sep + "labels" + os.sep)
+    lbl_path = os.path.splitext(lbl_path)[0] + ".txt"
+    return 1 if (os.path.exists(lbl_path) and os.path.getsize(lbl_path) > 0) else 0
+
+def clean_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def get_weight_path(model_name, m_type):
+    if m_type == "tv":
+        return os.path.join(PROJECT_ROOT, f"{model_name}_optimized_best.pth")
+    return os.path.join(PROJECT_ROOT, f"{model_name}_Baseline", "weights", "best.pt")
+
+class EvalDataset(Dataset):
+    def __init__(self, txt_path, img_size=640):
+        with open(txt_path, "r") as f:
+            self.paths = [line.strip() for line in f if line.strip()]
+        self.img_size = img_size
+    def __len__(self):
+        return len(self.paths)
+    def __getitem__(self, idx):
+        p = self.paths[idx]
+        img = Image.open(p).convert("RGB").resize((self.img_size, self.img_size), Image.BILINEAR)
+        return TF.to_tensor(img), p
+
+def get_tv_model(model_name, weights_path):
+    if model_name == "Faster_RCNN":
+        ag = AnchorGenerator(sizes=((16,), (32,), (64,), (128,), (256,)), aspect_ratios=((0.5, 1.0, 2.0),) * 5)
+        model = fasterrcnn_resnet50_fpn(weights=None, rpn_anchor_generator=ag, min_size=640, max_size=640)
+        in_feat = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(in_feat, num_classes=2)
+    else:
+        model = ssd300_vgg16(weights=None)
+        num_anchors = model.anchor_generator.num_anchors_per_location()
+        model.head = SSDHead([512, 1024, 512, 256, 256, 256], num_anchors, num_classes=2)
+    model.load_state_dict(torch.load(weights_path, map_location=DEVICE))
+    model.to(DEVICE).eval()
+    return model
+
+# ================================================================
+# 3. STREAMING INFERENCE ENGINE
+# ================================================================
+def run_model_inference(model_name, m_type, weights_path, split_txt, split_name):
+    cache_file = os.path.join(SCORES_CACHE_DIR, f"{model_name}_{split_name}.csv")
+    if os.path.exists(cache_file):
+        print(f" -> Found cached scores for {model_name} [{split_name}]. Loading...")
+        df_cached = pd.read_csv(cache_file)
+        return df_cached['gt'].values, df_cached['score'].values, df_cached['pid'].values
+
+    print(f" -> Running inference: {model_name} on {split_name}...")
+    y_true, y_score, pids = [], [], []
+
+    if m_type in ["yolo", "rtdetr"]:
+        model = RTDETR(weights_path) if m_type == "rtdetr" else YOLO(weights_path)
+        # Passing split_txt path directly avoids storing 37k paths in memory
+        results = model.predict(
+            source=split_txt, conf=MIN_CONF_THRESH, imgsz=IMG_SIZE,
+            device=DEVICE_ID, stream=True, verbose=False, batch=8
+        )
+        for i, res in enumerate(results):
+            img_p = res.path
+            gt = get_gt_label(img_p)
+            pid = get_patient_id(img_p)
+            max_conf = float(res.boxes.conf.max().item()) if (res.boxes is not None and len(res.boxes) > 0) else 0.0
+            
+            y_true.append(gt)
+            pids.append(pid)
+            y_score.append(max_conf)
+            if (i + 1) % 5000 == 0:
+                print(f"    ... {i + 1:,} images evaluated ...")
+        del model
+
+    elif m_type == "tv":
+        model = get_tv_model(model_name, weights_path)
+        loader = DataLoader(EvalDataset(split_txt, IMG_SIZE), batch_size=TV_BATCH_SIZE, shuffle=False, num_workers=0)
+        
+        with torch.inference_mode():
+            for i, (imgs, paths) in enumerate(loader):
+                inputs = [img.to(DEVICE) for img in imgs]
+                preds = model(inputs)
+                for j, p in enumerate(preds):
+                    img_p = paths[j]
+                    gt = get_gt_label(img_p)
+                    pid = get_patient_id(img_p)
+                    scores = p["scores"]
+                    max_conf = float(scores.max().item()) if len(scores) > 0 else 0.0
+                    
+                    y_true.append(gt)
+                    pids.append(pid)
+                    y_score.append(max_conf)
+                if (i * TV_BATCH_SIZE) % 5000 == 0 and i > 0:
+                    print(f"    ... {i * TV_BATCH_SIZE:,} images evaluated ...")
+        del model
+
+    clean_memory()
+
+    # Save to CSV immediately so work is never lost
+    df_out = pd.DataFrame({'gt': y_true, 'score': y_score, 'pid': pids})
+    df_out.to_csv(cache_file, index=False)
+    return df_out['gt'].values, df_out['score'].values, df_out['pid'].values
+
+# ================================================================
+# 4. METRICS
+# ================================================================
+def compute_metrics(y_true, y_score, t):
+    y_pred = (y_score >= t).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+    return sens, spec, acc, (sens + spec - 1.0)
+
+def compute_patient_metrics(y_true, y_score, pids, t):
+    df = pd.DataFrame({'gt': y_true, 'score': y_score, 'pid': pids})
+    df_pat = df.groupby('pid').agg(gt=('gt', 'max'), max_score=('score', 'max'))
+    return compute_metrics(df_pat['gt'].values, df_pat['max_score'].values, t)
+
+# ================================================================
+# 5. EXECUTION PIPELINE
+# ================================================================
+if __name__ == "__main__":
+    print("\n" + "=" * 80)
+    print("STARTING LIGHTWEIGHT THRESHOLD & ROC PIPELINE")
+    print("=" * 80)
+
+    summary_results = []
+    roc_plot_data = {}
+
+    for model_name, m_type in MODELS:
+        w_path = get_weight_path(model_name, m_type)
+        if not os.path.exists(w_path):
+            print(f"⚠️ Skipping {model_name}: weights not found at {w_path}")
+            continue
+
+        # Step 1: Validation inference -> Youden calculation
+        v_true, v_score, _ = run_model_inference(model_name, m_type, w_path, VAL_TXT, "Validation")
+
+        best_t, best_youden = 0.50, -1.0
+        for t in THRESHOLDS:
+            _, _, _, youden = compute_metrics(v_true, v_score, t)
+            if youden > best_youden:
+                best_youden = youden
+                best_t = t
+
+        # Step 2: Test set inference
+        t_true, t_score, t_pids = run_model_inference(model_name, m_type, w_path, TEST_TXT, "Test")
+        roc_plot_data[model_name] = (t_true, t_score)
+
+        # Evaluate at default 0.50 vs Youden-optimal threshold
+        sens_50, spec_50, acc_50, _ = compute_metrics(t_true, t_score, 0.50)
+        sens_opt, spec_opt, acc_opt, _ = compute_metrics(t_true, t_score, best_t)
+
+        p_sens_50, p_spec_50, p_acc_50, _ = compute_patient_metrics(t_true, t_score, t_pids, 0.50)
+        p_sens_opt, p_spec_opt, p_acc_opt, _ = compute_patient_metrics(t_true, t_score, t_pids, best_t)
+
+        row = {
+            "Model": model_name,
+            "Optimal_Threshold": best_t,
+            "Tile_Acc_0.50": round(acc_50, 4), "Tile_Acc_Opt": round(acc_opt, 4),
+            "Tile_Spec_0.50": round(spec_50, 4), "Tile_Spec_Opt": round(spec_opt, 4),
+            "Patient_Acc_0.50": round(p_acc_50, 4), "Patient_Acc_Opt": round(p_acc_opt, 4),
+            "Patient_Spec_0.50": round(p_spec_50, 4), "Patient_Spec_Opt": round(p_spec_opt, 4)
+        }
+        summary_results.append(row)
+        pd.DataFrame(summary_results).to_csv(SUMMARY_CSV, index=False)
+        print(f"✅ [{model_name}] Optimal Threshold: {best_t:.2f} | Patient Acc (0.50): {p_acc_50:.4f} -> Opt: {p_acc_opt:.4f}")
+
+    print("\n" + "=" * 80)
+    print("FINAL SUMMARY RESULTS:")
+    print("=" * 80)
+    df_res = pd.DataFrame(summary_results)
+    print(df_res.to_string(index=False))
+
+    # Generate ROC Curve plot
+    plt.figure(figsize=(10, 8))
+    sns.set_style("whitegrid")
+    colors = plt.cm.tab10(np.linspace(0, 1, len(roc_plot_data)))
+
+    for (model, (y_true, y_score)), color in zip(roc_plot_data.items(), colors):
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        roc_auc = auc(fpr, tpr)
+        plt.plot(fpr, tpr, color=color, lw=2, label=f"{model} (AUC={roc_auc:.3f})")
+
+    plt.plot([0, 1], [0, 1], 'k--', lw=1)
+    plt.xlabel('1 - Specificity (False Positive Rate)', fontsize=12, weight='bold')
+    plt.ylabel('Sensitivity (True Positive Rate)', fontsize=12, weight='bold')
+    plt.title('External Validation (UMMC): Tile-Level ROC Curves', fontsize=14, weight='bold')
+    plt.legend(fontsize=9, loc='lower right')
+
+    roc_out = os.path.join(OUTPUT_DIR, "External_ROC_Curves.png")
+    plt.tight_layout()
+    plt.savefig(roc_out, dpi=300)
+    plt.close()
+    print(f"\nCompleted successfully! Outputs saved in: {OUTPUT_DIR}")
