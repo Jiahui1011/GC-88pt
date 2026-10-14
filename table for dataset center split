@@ -1,0 +1,64 @@
+# table for dataset center split 
+import os
+import re
+from pathlib import Path
+
+# --- CONFIGURATION ---
+# This must point to the folder containing train.txt, val.txt, and test.txt
+OUTPUT_DIR = "./site_split_hkl_ummc"
+
+# Regex to extract Patient ID (e.g., PT02 from PT02HE1_...)
+PATIENT_ID_REGEX = re.compile(r"([A-Za-z]+\d+)HE\d+", re.IGNORECASE)
+
+def get_patient_id(filename):
+    m = PATIENT_ID_REGEX.search(filename)
+    return m.group(1).upper() if m else "UNKNOWN"
+
+def analyze_split_from_manifest(split_name):
+    manifest_path = Path(OUTPUT_DIR) / f"{split_name}.txt"
+    if not manifest_path.exists():
+        print(f"Manifest not found: {manifest_path}")
+        return
+
+    patient_status = {}
+    total_tiles = 0
+    positive_tiles = 0
+    negative_tiles = 0
+
+    with open(manifest_path, "r") as f:
+        image_paths = [line.strip() for line in f if line.strip()]
+
+    for img_path_str in image_paths:
+        img_path = Path(img_path_str)
+        total_tiles += 1
+        pid = get_patient_id(img_path.name)
+
+        if pid not in patient_status:
+            patient_status[pid] = False
+
+        # In YOLO format, labels share the same name as the image but are in the 'labels' folder as .txt
+        lbl_path_str = str(img_path).replace(os.sep + "images" + os.sep, os.sep + "labels" + os.sep)
+        lbl_path = Path(os.path.splitext(lbl_path_str)[0] + ".txt")
+
+        # If the label file exists and is not empty, it contains ganglion cell annotations
+        if lbl_path.exists() and lbl_path.stat().st_size > 0:
+            positive_tiles += 1
+            patient_status[pid] = True 
+        else:
+            negative_tiles += 1
+
+    ganglionic_patients = sum(1 for status in patient_status.values() if status)
+    aganglionic_patients = len(patient_status) - ganglionic_patients
+
+    print(f"--- {split_name.upper()} SPLIT ---")
+    print(f"Total Patients: {len(patient_status)}")
+    print(f"  -> Ganglionic (Positive):  {ganglionic_patients}")
+    print(f"  -> Aganglionic (Negative): {aganglionic_patients}")
+    print(f"Total Image Tiles: {total_tiles}")
+    print(f"  -> Ganglionic Tiles:       {positive_tiles}")
+    print(f"  -> Aganglionic Tiles:      {negative_tiles}\n")
+
+if __name__ == "__main__":
+    analyze_split_from_manifest("train")
+    analyze_split_from_manifest("val")
+    analyze_split_from_manifest("test")
