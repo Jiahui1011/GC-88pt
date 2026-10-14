@@ -1,0 +1,672 @@
+"""Publication-style qualitative detection panels, split into two figures.
+
+Automatically mines the UMMC external test set for four representative scenarios,
+then generates two figures comparing all ten HKL-trained architectures.
+
+Outputs:
+  qualitative_split_part1.png/.pdf  GT + first five models
+  qualitative_split_part2.png/.pdf  GT + remaining five models
+  qualitative_detection_counts.csv
+
+Edit CONFIG before running. Predictions are evaluated on FULL tiles before
+cropping; panel counts are re-evaluated within the visible crop.
+"""
+import csv
+import random
+import re
+import math
+import os
+from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+import numpy as np
+from PIL import Image
+import torch
+import torchvision
+import torchvision.transforms.functional as TF
+from ultralytics import YOLO, RTDETR
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, ssd300_vgg16
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.models.detection.ssd import SSDHead
+import yaml
+
+# ============================ CONFIG ============================
+# CURRENT HKL-trained models / UMMC external test (NOT the earlier 40-patient benchmark)
+PROJECT_ROOT = Path('./Site_Split_Run')
+DATASET_YAML = Path('./site_split_hkl_ummc/data.yaml').resolve()
+OUTPUT_DIR = Path('Qualitative_10_Models')
+IMG_SIZE = 640
+CONF_THRESH = 0.50
+MATCH_IOU = 0.50
+DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+# REQUIRED: calibrated micrometres per pixel of the actual exported image tiles.
+# Obtain from WSI scanner metadata AND account for any tile resizing/export.
+# Example: set environment variable QUAL_UM_PER_PIXEL to your verified value.
+UM_PER_PIXEL = float(os.environ.get('QUAL_UM_PER_PIXEL', '0.930'))  # 0.465 µm/pixel at 1280px, resized to 640px
+# One scale bar per scenario, on the bottom model row.
+SCALE_BAR_EVERY_PANEL = False  # One bar in bottom model row of each scenario column
+
+# Automatically mine UMMC external test images. No filenames required.
+# Mining uses 3 screening models, then all 10 models on shortlisted images.
+# Set MAX_SCAN=None for all test tiles (slower); 2500-5000 for a first run.
+MAX_SCAN = 3500
+SEED = 42
+SCREENING_MODELS = ['YOLO26m', 'RT-DETR-L', 'Faster R-CNN']
+SHORTLIST_PER_CATEGORY = 12
+# Override a category after pathologist review, if desired: {'A': 'filename.jpg'}
+MANUAL_OVERRIDES = {}
+# Dataset-specific clinical convention supplied by researcher:
+# ALL RB (rectal biopsy) patients in the UMMC test set are confirmed HD,
+# and their tiles contain no annotated ganglion cells.
+# Require BOTH an RB patient identifier and zero ground-truth boxes for row C.
+HD_RECTAL_BIOPSY_PREFIX = 'RB'
+
+ROW_LABELS = [
+    'A  True positive',
+    'B  False negative',
+    'C  Specificity (HD rectal biopsy)'
+]
+ROW_CROP_FRACTIONS = [0.85, 1.00, 0.85]  # More tissue context, less clutter
+
+MODEL_PATHS = {
+    'YOLOv5mu': PROJECT_ROOT/'YOLOv5mu_Baseline/weights/best.pt',
+    'YOLOv8m': PROJECT_ROOT/'YOLOv8m_Baseline/weights/best.pt',
+    'YOLOv9c': PROJECT_ROOT/'YOLOv9c_Baseline/weights/best.pt',
+    'YOLOv10m': PROJECT_ROOT/'YOLOv10m_Baseline/weights/best.pt',
+    'YOLO11m': PROJECT_ROOT/'YOLO11m_Baseline/weights/best.pt',
+    'YOLO12m': PROJECT_ROOT/'YOLO12m_Baseline/weights/best.pt',
+    'YOLO26m': PROJECT_ROOT/'YOLO26m_Baseline/weights/best.pt',
+    'RT-DETR-L': PROJECT_ROOT/'RT-DETR-L_Baseline/weights/best.pt',
+    'Faster R-CNN': PROJECT_ROOT/'Faster_RCNN_optimized_best.pth',
+    'SSD-VGG16': PROJECT_ROOT/'SSD_VGG16_optimized_best.pth',
+}
+MODEL_GROUPS = [
+    ('part1', ['YOLOv5mu','YOLOv8m','YOLOv9c','YOLOv10m','YOLO11m']),
+    ('part2', ['YOLO12m','YOLO26m','RT-DETR-L','Faster R-CNN','SSD-VGG16']),
+]
+# Original green/yellow/red scheme; no dark underlay on detection boxes.
+COL_GT = '#00A651'
+COL_TP = '#FFFF00'
+COL_FP = '#D32F2F'
+# No separate FN colour: missed GT remain green dashed, as in original figure.
+FIG_WIDTH = 27.0
+DPI = 600
+# ================================================================
+
+
+def load_gt(path, width, height):
+    out = []
+    if not path.exists():
+        raise FileNotFoundError(f'Annotation file missing: {path}')
+    for line in path.read_text().splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        _, cx, cy, bw, bh = map(float, fields[:5])
+        box = [(cx-bw/2)*width, (cy-bh/2)*height,
+               (cx+bw/2)*width, (cy+bh/2)*height]
+        if box[2] > box[0] and box[3] > box[1]:
+            out.append(box)
+    return np.asarray(out, dtype=float).reshape(-1, 4)
+
+
+def iou_matrix(preds, gts):
+    if not len(preds) or not len(gts):
+        return np.zeros((len(preds), len(gts)))
+    tl = np.maximum(preds[:, None, :2], gts[None, :, :2])
+    br = np.minimum(preds[:, None, 2:], gts[None, :, 2:])
+    wh = np.maximum(br-tl, 0)
+    inter = wh[:, :, 0]*wh[:, :, 1]
+    ap = np.prod(np.maximum(preds[:, 2:]-preds[:, :2], 0), axis=1)
+    ag = np.prod(np.maximum(gts[:, 2:]-gts[:, :2], 0), axis=1)
+    return inter/np.maximum(ap[:, None]+ag[None, :]-inter, 1e-12)
+
+
+def match_detections(boxes, scores, gts):
+    """One-to-one greedy match, predictions ordered by descending confidence.
+    Returns per-prediction labels in ORIGINAL prediction order and missed GT IDs.
+    """
+    labels = ['FP']*len(boxes)
+    unmatched = set(range(len(gts)))
+    mat = iou_matrix(boxes, gts)
+    for p in np.argsort(-scores, kind='stable'):
+        if not unmatched:
+            break
+        available = sorted(unmatched)
+        vals = mat[p, available]
+        best_local = int(np.argmax(vals))
+        best_gt = available[best_local]
+        if vals[best_local] >= MATCH_IOU:
+            labels[p] = 'TP'
+            unmatched.remove(best_gt)
+    return labels, sorted(unmatched)
+
+
+def build_torchvision(name):
+    if name == 'Faster R-CNN':
+        ag = AnchorGenerator(sizes=((16,), (32,), (64,), (128,), (256,)),
+                             aspect_ratios=((0.5, 1.0, 2.0),)*5)
+        model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None,
+                    rpn_anchor_generator=ag, min_size=640, max_size=640,
+                    box_score_thresh=0.001)
+        n = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(n, 2)
+    elif name == 'SSD-VGG16':
+        model = ssd300_vgg16(weights=None, weights_backbone=None)
+        anchors = model.anchor_generator.num_anchors_per_location()
+        model.head = SSDHead([512,1024,512,256,256,256], anchors, num_classes=2)
+    else:
+        raise ValueError(name)
+    state = torch.load(MODEL_PATHS[name], map_location='cpu', weights_only=True)
+    model.load_state_dict(state, strict=True)
+    return model.to(DEVICE).eval()
+
+
+def get_predictions(model_name, model, img_path, img):
+    w, h = img.size
+    if model_name not in ('Faster R-CNN', 'SSD-VGG16'):
+        res = model.predict(str(img_path), imgsz=IMG_SIZE, conf=CONF_THRESH,
+                            device=DEVICE, verbose=False, max_det=100)[0]
+        if res.boxes is None or len(res.boxes) == 0:
+            return np.empty((0, 4)), np.empty((0,))
+        return (res.boxes.xyxy.detach().cpu().numpy().astype(float),
+                res.boxes.conf.detach().cpu().numpy().astype(float))
+    tensor = TF.to_tensor(img.resize((IMG_SIZE, IMG_SIZE), Image.Resampling.BILINEAR)).to(DEVICE)
+    with torch.inference_mode():
+        out = model([tensor])[0]
+    keep = ((out['scores'] >= CONF_THRESH) & (out['labels'] == 1)).detach().cpu().numpy()
+    scores = out['scores'].detach().cpu().numpy()[keep]
+    boxes = out['boxes'].detach().cpu().numpy()[keep].astype(float)
+    if len(boxes):
+        boxes[:, [0,2]] *= w / IMG_SIZE
+        boxes[:, [1,3]] *= h / IMG_SIZE
+    return boxes, scores
+
+
+def resolve_test_images():
+    data = yaml.safe_load(DATASET_YAML.read_text())
+    txt = Path(data['test'])
+    if not txt.is_absolute():
+        txt = DATASET_YAML.parent / txt
+    paths = []
+    for line in txt.read_text().splitlines():
+        if line.strip():
+            p = Path(line.strip())
+            if not p.is_absolute() and not p.exists():
+                p = DATASET_YAML.parent / p
+            paths.append(p.resolve())
+    return paths
+
+def square_crop(img, gts, frac):
+    w, h = img.size
+    side = min(w, h)*frac
+    if len(gts):
+        # Focus on annotated area, but ensure all GT boxes fit when possible.
+        cx = float((gts[:, 0].min()+gts[:, 2].max())/2)
+        cy = float((gts[:, 1].min()+gts[:, 3].max())/2)
+        footprint = max(gts[:, 2].max()-gts[:, 0].min(),
+                        gts[:, 3].max()-gts[:, 1].min())
+        side = min(min(w, h), max(side, footprint*1.18))
+    else:
+        cx, cy = w/2, h/2
+    x0 = np.clip(cx-side/2, 0, w-side)
+    y0 = np.clip(cy-side/2, 0, h-side)
+    return tuple(map(float, (x0, y0, x0+side, y0+side)))
+
+
+def overlaps_crop(box, crop):
+    x0, y0, x1, y1 = crop
+    return box[2] > x0 and box[0] < x1 and box[3] > y0 and box[1] < y1
+
+
+def visible_region_detections(pred, gt, crop):
+    """Re-evaluate detection matching using only boxes visible in this crop.
+
+    Boxes crossing the crop boundary are clipped before local IoU matching.
+    These are DISPLAY-ONLY counts, not the full-tile evaluation metrics.
+    """
+    crop_arr = np.asarray(crop, dtype=float)
+
+    def clip_visible(boxes):
+        boxes = np.asarray(boxes, dtype=float).reshape(-1, 4)
+        if len(boxes) == 0:
+            return np.empty((0, 4)), np.zeros(0, dtype=bool)
+        clipped = boxes.copy()
+        clipped[:, [0, 2]] = np.clip(clipped[:, [0, 2]], crop_arr[0], crop_arr[2])
+        clipped[:, [1, 3]] = np.clip(clipped[:, [1, 3]], crop_arr[1], crop_arr[3])
+        visible = ((clipped[:, 2] > clipped[:, 0]) &
+                   (clipped[:, 3] > clipped[:, 1]))
+        return clipped[visible], visible
+
+    boxes, visible_preds = clip_visible(pred['boxes'])
+    gts, _ = clip_visible(gt)
+    scores = np.asarray(pred['scores'])[visible_preds]
+    labels, missed = match_detections(boxes, scores, gts)
+    return dict(boxes=boxes, gt=gts, labels=labels,
+                tp=labels.count('TP'), fp=labels.count('FP'), fn=len(missed))
+
+
+def draw_box(ax, box, color, style='-', width=2.5, z=4):
+    """Draw one coloured outline only: no black border or halo."""
+    x0, y0, x1, y1 = box
+    ax.add_patch(Rectangle(
+        (x0, y0), x1 - x0, y1 - y0,
+        fill=False, linewidth=width, edgecolor=color,
+        linestyle=style, zorder=z, joinstyle='miter'
+    ))
+
+
+def add_scale_bar(ax, crop):
+    """Draw a physical-length scale bar using the displayed crop coordinates."""
+    x0, y0, x1, y1 = crop
+    side = x1 - x0
+    # Physical bar length is in original 640-pixel tile coordinates.
+    # Cropping/zooming changes the displayed field of view, not UM_PER_PIXEL.
+    # Choose a conventional length occupying at most 18% of visible width.
+    um = next((v for v in [50, 20, 10, 5, 2, 1]
+               if v / UM_PER_PIXEL <= side * 0.18), None)
+    if um is None:
+        raise ValueError('Scale bar cannot fit: check QUAL_UM_PER_PIXEL and crop size.')
+    length = um / UM_PER_PIXEL
+    bx = x1 - side * 0.035 - length  # lower-right corner
+    by = y1 - side * 0.040
+    # Light backing improves visibility on H&E; no black halo or box outline.
+    pad = side * 0.009
+    ax.add_patch(Rectangle((bx - pad, by - side * 0.047),
+                           length + 2 * pad, side * 0.065,
+                           facecolor='white', edgecolor='none',
+                           alpha=0.82, zorder=11))
+    ax.plot([bx, bx + length], [by, by], color='black',
+            lw=2.3, solid_capstyle='butt', zorder=12)
+    ax.text(bx + length / 2, by - side * 0.012, f'{um} µm',
+            color='black', fontsize=7.5, weight='bold',
+            ha='center', va='bottom', zorder=13)
+
+
+def render_figure(suffix, model_names, cases, preds):
+    """Five model rows × three scenario columns, same view per scenario.
+
+    Scale bar is shown only in the last model row for each scenario.
+    """
+    n_rows, n_cols = len(model_names), len(cases)
+    # Large square panels with very narrow gutters and rotated model names.
+    panel_in = 4.35
+    gap_x_in, gap_y_in = 0.035, 0.035
+    left_in, right_in = 0.43, 0.06
+    top_in, bottom_in = 0.56, 0.40
+    fw = left_in + n_cols * panel_in + (n_cols - 1) * gap_x_in + right_in
+    fh = top_in + n_rows * panel_in + (n_rows - 1) * gap_y_in + bottom_in
+    fig = plt.figure(figsize=(fw, fh), facecolor='white')
+
+    for col, case in enumerate(cases):
+        img, gt, crop = case['img'], case['gt'], case['crop']
+        x0, y0, x1, y1 = crop
+        for row, name in enumerate(model_names):
+            left = (left_in + col * (panel_in + gap_x_in)) / fw
+            bottom = (bottom_in + (n_rows - 1 - row) * (panel_in + gap_y_in)) / fh
+            ax = fig.add_axes([left, bottom, panel_in / fw, panel_in / fh])
+            ax.imshow(img, interpolation='nearest')
+            ax.set_xlim(x0, x1)
+            ax.set_ylim(y1, y0)
+            ax.set_aspect('equal', adjustable='box')
+            ax.set_axis_off()
+            if row == 0:
+                ax.set_title(ROW_LABELS[col], fontsize=12, weight='bold', pad=11)
+            if col == 0:
+                ax.text(-0.045, 0.5, name, transform=ax.transAxes,
+                        rotation=90, ha='center', va='center', fontsize=10.0,
+                        weight='bold', clip_on=False)
+
+            pred = preds[(col, name)]
+            local = visible_region_detections(pred, gt, crop)
+            for box, label in zip(local['boxes'], local['labels']):
+                draw_box(ax, box, COL_TP if label == 'TP' else COL_FP,
+                         width=2.1, z=4)
+            for box in local['gt']:
+                draw_box(ax, box, COL_GT, style='--', width=1.8, z=7)
+
+            # Display-only counts, calculated after clipping boxes to the
+            # visible zoom region and repeating one-to-one IoU matching.
+            # A/B: object-level matching. C: no ganglion GT exists, so
+            # show FP count or TN (negative tile, no detections).
+            # TN is an image-level label, not a bounding-box count.
+            if col == 2 and len(local['gt']) == 0:
+                counts = f"FP {local['fp']}" if local['fp'] else 'TN'
+            else:
+                counts = f"TP {local['tp']}  FP {local['fp']}  FN {local['fn']}"
+            ax.text(0.012, 0.012, counts, transform=ax.transAxes,
+                    ha='left', va='bottom', fontsize=7.0, weight='medium',
+                    color='black', zorder=20,
+                    bbox=dict(facecolor='white', edgecolor='none',
+                              alpha=0.78, pad=1.2))
+
+            # Same crop for all five model rows in each scenario;
+            # one correctly calibrated bar on the bottom image is sufficient.
+            if SCALE_BAR_EVERY_PANEL or row == n_rows - 1:
+                add_scale_bar(ax, crop)
+
+    handles = [
+        Line2D([0], [0], color=COL_GT, ls='--', lw=2.6, label='Ground truth'),
+        Line2D([0], [0], color=COL_TP, lw=2.6, label='True positive'),
+        Line2D([0], [0], color=COL_FP, lw=2.6, label='False positive'),
+    ]
+    fig.legend(handles=handles, loc='lower center', ncol=3,
+               fontsize=10, frameon=False, bbox_to_anchor=(0.52, 0.002))
+    for ext in ('png', 'pdf'):
+        out = OUTPUT_DIR / f'qualitative_split_{suffix}.{ext}'
+        fig.savefig(out, dpi=DPI if ext == 'png' else 200, facecolor='white')
+        print('Saved:', out)
+    plt.close(fig)
+
+
+def choose_display_crop(img, gt, case_predictions, category):
+    """Focus on annotated cells (A/B) or false positives (C).
+
+    Use one shared crop across all models and both figures so comparisons
+    remain aligned. Display zoom does not change µm/pixel coordinates.
+    """
+    w, h = img.size
+    if category in ('A', 'B'):
+        focus = gt
+    else:
+        fp_boxes = []
+        for p in case_predictions.values():
+            fp_boxes.extend(box for box, label in zip(p['boxes'], p['labels'])
+                            if label == 'FP')
+        focus = np.asarray(fp_boxes, dtype=float).reshape(-1, 4)
+
+    if len(focus):
+        # Median centre reduces influence of widely separated detections.
+        centres = (focus[:, :2] + focus[:, 2:]) / 2
+        cx, cy = np.median(centres, axis=0)
+        # Show a meaningful histological region, not a tiny cell-only cutout.
+        side = min(w, h) * 0.64
+    else:
+        cx, cy = w / 2, h / 2
+        side = min(w, h) * 0.85
+    # Do not enlarge the crop merely to fit a 50 µm scale bar;
+    # add_scale_bar() will choose a shorter calibrated bar when zoomed.
+    side = min(side, min(w, h))
+    x0 = float(np.clip(cx - side / 2, 0, w - side))
+    y0 = float(np.clip(cy - side / 2, 0, h - side))
+    return (x0, y0, x0 + side, y0 + side)
+
+
+def patient_key(path):
+    """Best-effort grouping; update regex if your filenames differ."""
+    m = re.search(r'([A-Za-z]+\d+)HE\d+', path.stem, re.I)
+    return m.group(1).upper() if m else path.stem.split('_')[0]
+
+
+def is_hd_rectal_biopsy(path):
+    return patient_key(path).startswith(HD_RECTAL_BIOPSY_PREFIX)
+
+
+def summarize_case(path, models, model_names):
+    img = Image.open(path).convert('RGB')
+    label_path = Path(str(path).replace(f'{os.sep}images{os.sep}',
+                          f'{os.sep}labels{os.sep}')).with_suffix('.txt')
+    gt = load_gt(label_path, *img.size)
+    stats = {}
+    for name in model_names:
+        boxes, scores = get_predictions(name, models[name], path, img)
+        labels, missed = match_detections(boxes, scores, gt)
+        stats[name] = dict(tp=labels.count('TP'), fp=labels.count('FP'),
+                           fn=len(missed), boxes=boxes, scores=scores,
+                           labels=labels, missed=missed)
+    return dict(path=path, gt=gt, n_gt=len(gt), stats=stats)
+
+
+def score_categories(item, screening):
+    """Rank by diversity of observed errors, not by YOLO-favouring results."""
+    st = [item['stats'][name] for name in screening]
+    n = item['n_gt']
+    total_tp = sum(x['tp'] for x in st)
+    total_fp = sum(x['fp'] for x in st)
+    total_fn = sum(x['fn'] for x in st)
+    out = {}
+    if n > 0:
+        # Prefer moderate GT density; avoid huge clutter and extreme showcase cases.
+        if 1 <= n <= 6 and sum(x['fn'] == 0 and x['fp'] == 0 for x in st) >= 2:
+            out['A'] = 20 - abs(n - 2)*2 + sum(x['fn'] == 0 and x['fp'] == 0 for x in st)
+        # Require both a successful and an unsuccessful model for an informative FN row.
+        if 1 <= n <= 8 and total_fn > 0 and total_tp > 0:
+            out['B'] = 10 + min(total_fn, 8) + min(total_tp, 8) - max(0, n-4)
+    else:
+        # At least one FP and at least one model correctly abstaining.
+        if total_fp > 0 and any(x['fp'] == 0 for x in st):
+            out['C'] = 10 + min(total_fp, 8) + sum(x['fp'] == 0 for x in st)
+        if all(x['fp'] == 0 for x in st):
+            out['D'] = 10
+    return out
+
+
+def mine_cases(test_images, models):
+    rng = random.Random(SEED)
+    paths = list(test_images)
+    rng.shuffle(paths)
+    if MAX_SCAN is not None:
+        paths = paths[:MAX_SCAN]
+    print(f'Screening {len(paths)} UMMC tiles with {SCREENING_MODELS}...', flush=True)
+    buckets = {k: [] for k in 'ABC'}
+    audit = []
+    for idx, path in enumerate(paths, 1):
+        try:
+            item = summarize_case(path, models, SCREENING_MODELS)
+            scores = score_categories(item, SCREENING_MODELS)
+            audit.append(dict(image=str(path), patient=patient_key(path),
+                              ground_truth_count=item['n_gt'],
+                              **{f'score_{k}': scores.get(k, '') for k in 'ABC'}))
+            for key, value in scores.items():
+                if key == 'C' and (not is_hd_rectal_biopsy(path) or item['n_gt'] != 0):
+                    continue  # Row C must come from a confirmed HD patient
+                buckets[key].append((value, item))
+        except Exception as e:
+            print(f'Skipping {path.name}: {e}', flush=True)
+        if idx % 100 == 0:
+            print(f'  {idx}/{len(paths)} | candidate counts: '
+                  + ', '.join(f'{k}={len(v)}' for k,v in buckets.items()), flush=True)
+    with (OUTPUT_DIR/'screening_audit.csv').open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['image','patient','ground_truth_count']
+                                + [f'score_{k}' for k in 'ABC'])
+        writer.writeheader(); writer.writerows(audit)
+    return buckets
+
+
+def select_cases(buckets, models, test_images):
+    all_by_name = {p.name: p for p in test_images}
+    selected = {}
+    used_patients = set()
+    shortlist_rows = []
+    for key in 'ABC':
+        ranked = sorted(buckets[key], key=lambda x: (-x[0], x[1]['path'].name))
+        # Diversify patients in the candidate shortlist.
+        unique, seen = [], set()
+        for score, item in ranked:
+            pid = patient_key(item['path'])
+            if pid not in seen:
+                unique.append((score, item)); seen.add(pid)
+            if len(unique) >= SHORTLIST_PER_CATEGORY:
+                break
+        if len(unique) < SHORTLIST_PER_CATEGORY:
+            for score, item in ranked:
+                if not any(x['path'] == item['path'] for _, x in unique):
+                    unique.append((score, item))
+                if len(unique) >= SHORTLIST_PER_CATEGORY:
+                    break
+        # Rerank shortlisted candidates with all ten models.
+        enriched = []
+        for base_score, item in unique:
+            full = summarize_case(item['path'], models, list(MODEL_PATHS))
+            st = list(full['stats'].values())
+            if key == 'A':
+                quality = sum(x['fn'] == 0 and x['fp'] == 0 for x in st)
+            elif key == 'B':
+                quality = min(sum(x['fn'] > 0 for x in st), sum(x['tp'] > 0 for x in st))
+            elif key == 'C':
+                quality = min(sum(x['fp'] > 0 for x in st), sum(x['fp'] == 0 for x in st))
+            else:
+                quality = sum(x['fp'] == 0 for x in st)
+            enriched.append((quality, base_score, full))
+            shortlist_rows.append(dict(category=key, image=str(item['path']),
+                patient=patient_key(item['path']), screening_score=base_score,
+                all_model_score=quality, gt_count=full['n_gt'],
+                models_with_TP=sum(x['tp']>0 for x in st),
+                models_with_FP=sum(x['fp']>0 for x in st),
+                models_with_FN=sum(x['fn']>0 for x in st)))
+        enriched.sort(key=lambda z: (-z[0], -z[1], z[2]['path'].name))
+        if key in MANUAL_OVERRIDES:
+            override = MANUAL_OVERRIDES[key]
+            if override not in all_by_name:
+                raise ValueError(f'MANUAL_OVERRIDES[{key}] not in test split: {override}')
+            if key == 'C' and not is_hd_rectal_biopsy(all_by_name[override]):
+                raise ValueError('Row C override must be an RB (HD rectal biopsy) patient.')
+            chosen = summarize_case(all_by_name[override], models, list(MODEL_PATHS))
+            if key == 'C' and chosen['n_gt'] != 0:
+                raise ValueError('Row C override must have zero ground-truth ganglion boxes.')
+            if patient_key(chosen['path']) in used_patients:
+                raise ValueError('Manual override reuses a patient from an earlier row.')
+        else:
+            eligible = [x for _, _, x in enriched
+                        if patient_key(x['path']) not in used_patients]
+            # Refresh row A: use the second-ranked eligible image instead of
+            # the previously selected top-ranked example, when possible.
+            chosen = (eligible[1] if key == 'A' and len(eligible) > 1
+                      else eligible[0] if eligible else None)
+            # Never reuse a patient for another row; each row must be distinct.
+        if chosen is None:
+            raise RuntimeError(f'No candidate found for category {key}. '
+                               'Increase MAX_SCAN or review screening_audit.csv.')
+        if key == 'C' and (not is_hd_rectal_biopsy(chosen['path']) or chosen['n_gt'] != 0):
+            raise AssertionError('Row C must be an RB patient with zero ganglion annotations.')
+        selected[key] = chosen
+        used_patients.add(patient_key(chosen['path']))
+        print(f'Selected {key}: {chosen["path"].name} | patient={patient_key(chosen["path"])}')
+    with (OUTPUT_DIR/'shortlist_for_pathologist_review.csv').open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(shortlist_rows[0]))
+        writer.writeheader(); writer.writerows(shortlist_rows)
+    return selected
+
+
+def select_from_saved_shortlist(models, test_images):
+    """Reuse candidates saved by an earlier screening run; do not mine images again."""
+    cache = OUTPUT_DIR / 'shortlist_for_pathologist_review.csv'
+    if not cache.is_file() and set(MANUAL_OVERRIDES) != set('ABC'):
+        raise FileNotFoundError(
+            f'No saved shortlist at {cache}. This version deliberately skips '
+            'image mining. Restore the shortlist CSV from your previous run '
+            'or set MANUAL_OVERRIDES for A, B, and C.'
+        )
+    if cache.is_file():
+        with cache.open(newline='') as f:
+            records = list(csv.DictReader(f))
+    else:
+        records = []
+    path_lookup = {str(p.resolve()): p for p in test_images}
+    name_lookup = {p.name: p for p in test_images}
+    selected, used_patients = {}, set()
+    for key in 'ABC':
+        candidates = []
+        if key in MANUAL_OVERRIDES:
+            candidate_paths = [name_lookup.get(MANUAL_OVERRIDES[key])]
+            if candidate_paths[0] is None:
+                raise ValueError(f'Unknown manual override for row {key}: {MANUAL_OVERRIDES[key]}')
+        else:
+            ranked = sorted(
+                (r for r in records if r.get('category') == key),
+                key=lambda r: (-float(r.get('all_model_score') or 0),
+                               -float(r.get('screening_score') or 0),
+                               r.get('image', ''))
+            )
+            candidate_paths = []
+            for r in ranked:
+                old = Path(r['image'])
+                path = path_lookup.get(str(old.resolve())) or name_lookup.get(old.name)
+                if path is not None and path not in candidate_paths:
+                    candidate_paths.append(path)
+            if key in ('A', 'B') and len(candidate_paths) > 1:
+                # Rotate cached candidates so both A and B change images.
+                # Retain the old first candidate as a fallback only.
+                candidate_paths = candidate_paths[1:] + candidate_paths[:1]
+        for path in candidate_paths:
+            if path is None or patient_key(path) in used_patients:
+                continue
+            if key == 'C' and not is_hd_rectal_biopsy(path):
+                continue
+            # Only run inference for the three selected images, not the full test set.
+            item = summarize_case(path, models, list(MODEL_PATHS))
+            if key == 'C' and item['n_gt'] != 0:
+                continue
+            if key in 'AB' and item['n_gt'] == 0:
+                continue
+            candidates.append(item)
+            break
+        if not candidates:
+            raise RuntimeError(
+                f'No suitable saved candidate for row {key} from a distinct patient. '
+                f'Check {cache} or supply MANUAL_OVERRIDES.'
+            )
+        chosen = candidates[0]
+        selected[key] = chosen
+        used_patients.add(patient_key(chosen['path']))
+        print(f'Selected cached row {key}: {chosen["path"].name} '
+              f'| patient={patient_key(chosen["path"])}', flush=True)
+    return selected
+
+
+def main():
+    if UM_PER_PIXEL is None or not np.isfinite(UM_PER_PIXEL) or UM_PER_PIXEL <= 0:
+        raise ValueError(
+            'A calibrated scale bar is required. Set QUAL_UM_PER_PIXEL to the '
+            'verified micrometres-per-pixel value of your exported tiles. '
+            'Do not assume this from the 20× magnification alone.'
+        )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    test_images = resolve_test_images()
+    if not test_images:
+        raise RuntimeError('No UMMC test images resolved.')
+    for name, path in MODEL_PATHS.items():
+        if not path.is_file():
+            raise FileNotFoundError(f'{name} weights missing: {path}')
+    print('Loading all ten HKL-trained models...')
+    models = {}
+    for name, path in MODEL_PATHS.items():
+        models[name] = (build_torchvision(name) if name in ('Faster R-CNN','SSD-VGG16')
+                        else RTDETR(str(path)) if name == 'RT-DETR-L'
+                        else YOLO(str(path)))
+    # Reuse existing shortlist: no 3500-image screening pass.
+    selected = select_from_saved_shortlist(models, test_images)
+    cases, pred_cache, rows = [], {}, []
+    for row, key in enumerate('ABC'):
+        item = selected[key]
+        img_path = item['path']
+        img = Image.open(img_path).convert('RGB')
+        gt = item['gt']
+        crop = choose_display_crop(img, gt, item['stats'], key)
+        cases.append(dict(path=img_path, img=img, gt=gt, crop=crop))
+        for name in MODEL_PATHS:
+            p = item['stats'][name]
+            pred_cache[(row,name)] = dict(boxes=p['boxes'], scores=p['scores'], labels=p['labels'],
+                missed=p['missed'], tp=p['tp'], fp=p['fp'], fn=p['fn'])
+            local = visible_region_detections(pred_cache[(row,name)], gt, crop)
+            rows.append(dict(case=ROW_LABELS[row], image=img_path.name,
+                patient=patient_key(img_path), model=name, ground_truth_boxes=len(gt),
+                predicted_boxes=len(p['boxes']), TP=p['tp'], FP=p['fp'], FN=p['fn'],
+                visible_GT=len(local['gt']), visible_predictions=len(local['boxes']),
+                visible_TP=local['tp'], visible_FP=local['fp'], visible_FN=local['fn'],
+                confidence_threshold=CONF_THRESH, match_iou=MATCH_IOU))
+    with (OUTPUT_DIR/'qualitative_detection_counts.csv').open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader(); writer.writerows(rows)
+    for suffix, names in MODEL_GROUPS:
+        render_figure(suffix, names, cases, pred_cache)
+    print('Finished. Expert review is required to confirm histological interpretation.')
+
+
+if __name__ == '__main__':
+    main()
