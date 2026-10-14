@@ -1,0 +1,90 @@
+import pandas as pd
+from pathlib import Path
+
+ROOT = Path("./Site_Split_Run")
+
+THRESHOLD_FILE = (
+    ROOT /
+    "Threshold_Analytics" /
+    "Threshold_Optimization_Results.csv"
+)
+
+CACHE_DIR = (
+    ROOT /
+    "Threshold_Analytics" /
+    "cache_scores"
+)
+
+# =====================================================
+# 1. EXISTING OPTIMAL THRESHOLDS
+# =====================================================
+
+threshold_df = pd.read_csv(THRESHOLD_FILE)
+
+print("=" * 85)
+print("EXISTING OPTIMAL THRESHOLDS")
+print("=" * 85)
+
+print(threshold_df.to_string(index=False))
+
+# =====================================================
+# 2. CHECK MODEL CACHE AVAILABILITY
+# =====================================================
+
+models = [
+    "YOLOv5mu",
+    "YOLOv8m",
+    "YOLOv9c",
+    "YOLOv10m",
+    "YOLO11m",
+    "YOLO12m",
+    "YOLO26m",
+    "RT-DETR-L",
+    "Faster_RCNN",
+    "SSD_VGG16"
+]
+
+print("\n" + "=" * 85)
+print("CACHE AVAILABILITY")
+print("=" * 85)
+
+for model in models:
+
+    val_file = CACHE_DIR / f"{model}_Validation.csv"
+    test_file = CACHE_DIR / f"{model}_Test.csv"
+
+    print(
+        f"{model:<15} "
+        f"Validation: {val_file.exists()} "
+        f"Test: {test_file.exists()}"
+    )
+
+# =====================================================
+# 3. DISPLAY PATIENT-AGGREGATED SCORES
+# =====================================================
+
+print("\n" + "=" * 85)
+print("PATIENT-AGGREGATED VALIDATION SCORES")
+print("=" * 85)
+
+for model in models:
+
+    file_path = CACHE_DIR / f"{model}_Validation.csv"
+
+    if not file_path.exists():
+        continue
+
+    df = pd.read_csv(file_path)
+
+    patient_scores = (
+        df.groupby("pid")
+        .agg(
+            reference=("gt", "max"),
+            max_score=("score", "max"),
+            n_tiles=("gt", "size")
+        )
+        .reset_index()
+    )
+
+    print(f"\n{model}")
+    print(patient_scores.to_string(index=False))
