@@ -1,0 +1,345 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# =====================================================
+# CONFIGURATION
+# =====================================================
+
+ROOT = Path("./Site_Split_Run")
+
+CACHE_DIR = ROOT / "Threshold_Analytics" / "cache_scores"
+
+REFERENCE_FILE = (
+    ROOT / "Patient_Reference_Audit"
+    / "Test_Patient_Reference.csv"
+)
+
+OUTPUT_DIR = ROOT / "Patient_Ganglion_Quantitative_Analysis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+MODELS = [
+    "YOLOv5mu",
+    "YOLOv8m",
+    "YOLOv9c",
+    "YOLOv10m",
+    "YOLO11m",
+    "YOLO12m",
+    "YOLO26m",
+    "RT-DETR-L",
+    "Faster_RCNN",
+    "SSD_VGG16"
+]
+
+IMAGE_THRESHOLD = 0.50
+
+RULES = {
+    "At_least_1_image": ("count", 1),
+    "At_least_2_images": ("count", 2),
+    "At_least_3_images": ("count", 3),
+    "At_least_1_percent": ("percentage", 0.01),
+    "At_least_5_percent": ("percentage", 0.05),
+    "At_least_10_percent": ("percentage", 0.10),
+    "At_least_50_percent": ("percentage", 0.50)
+}
+
+# =====================================================
+# LOAD REFERENCE
+# =====================================================
+
+reference = pd.read_csv(REFERENCE_FILE)
+
+reference["pid"] = (
+    reference["pid"]
+    .astype(str)
+    .str.strip()
+    .str.upper()
+)
+
+assert reference["pid"].is_unique
+
+if "audit_status" in reference.columns:
+    assert reference["audit_status"].eq("OK").all()
+
+assert len(reference) == 29
+
+# =====================================================
+# ANALYSIS
+# =====================================================
+
+all_patient_results = []
+all_rule_results = []
+
+for model in MODELS:
+
+    print(f"Processing {model}...")
+
+    file_path = CACHE_DIR / f"{model}_Test.csv"
+
+    df = pd.read_csv(file_path)
+
+    df["pid"] = (
+        df["pid"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    df["gt"] = pd.to_numeric(df["gt"])
+    df["score"] = pd.to_numeric(df["score"])
+
+    assert df["gt"].isin([0, 1]).all()
+    assert df["score"].between(0, 1).all()
+    assert df["score"].notna().all()
+
+    assert set(df["pid"]) == set(reference["pid"])
+
+    # Image-level classification
+    df["pred"] = (
+        df["score"] >= IMAGE_THRESHOLD
+    ).astype(int)
+
+    # Count positive images for each patient
+    patient = (
+        df.groupby("pid")
+        .agg(
+            Total_Images=("gt", "size"),
+            GT_Positive_Images=("gt", "sum"),
+            Pred_Positive_Images=("pred", "sum"),
+            Maximum_Confidence=("score", "max")
+        )
+        .reset_index()
+    )
+
+    patient["GT_Negative_Images"] = (
+        patient["Total_Images"]
+        - patient["GT_Positive_Images"]
+    )
+
+    patient["Pred_Negative_Images"] = (
+        patient["Total_Images"]
+        - patient["Pred_Positive_Images"]
+    )
+
+    patient["GT_Positive_Percentage"] = (
+        patient["GT_Positive_Images"]
+        / patient["Total_Images"] * 100
+    )
+
+    patient["Pred_Positive_Percentage"] = (
+        patient["Pred_Positive_Images"]
+        / patient["Total_Images"] * 100
+    )
+
+    # Ground-truth patient ganglion status
+    patient["GT_Patient_Status"] = (
+        patient["GT_Positive_Images"] > 0
+    ).astype(int)
+
+    # Verify against audited reference
+    patient = patient.merge(
+        reference[
+            [
+                "pid",
+                "cohort",
+                "n_tiles",
+                "n_positive_tiles",
+                "ganglion_presence_gt"
+            ]
+        ],
+        on="pid",
+        validate="one_to_one"
+    )
+
+    assert (
+        patient["Total_Images"]
+        == patient["n_tiles"]
+    ).all()
+
+    assert (
+        patient["GT_Positive_Images"]
+        == patient["n_positive_tiles"]
+    ).all()
+
+    assert (
+        patient["GT_Patient_Status"]
+        == patient["ganglion_presence_gt"]
+    ).all()
+
+    patient["Model"] = model
+
+    # =================================================
+    # COMPARE DECISION RULES
+    # =================================================
+
+    for rule_name, (rule_type, cutoff) in RULES.items():
+
+        if rule_type == "count":
+
+            patient_prediction = (
+                patient["Pred_Positive_Images"] >= cutoff
+            ).astype(int)
+
+        else:
+
+            patient_prediction = (
+                patient["Pred_Positive_Images"]
+                / patient["Total_Images"]
+                >= cutoff
+            ).astype(int)
+
+        gt = patient["GT_Patient_Status"]
+
+        TP = int(((gt == 1) & (patient_prediction == 1)).sum())
+        TN = int(((gt == 0) & (patient_prediction == 0)).sum())
+        FP = int(((gt == 0) & (patient_prediction == 1)).sum())
+        FN = int(((gt == 1) & (patient_prediction == 0)).sum())
+
+        accuracy = (TP + TN) / len(patient)
+
+        sensitivity = TP / (TP + FN) if TP + FN else np.nan
+        specificity = TN / (TN + FP) if TN + FP else np.nan
+
+        all_rule_results.append({
+            "Model": model,
+            "Rule": rule_name,
+            "Correct_Ganglion_Present": TP,
+            "Correct_Ganglion_Absent": TN,
+            "False_Positive_Patients": FP,
+            "False_Negative_Patients": FN,
+            "Correct_Total": TP + TN,
+            "Incorrect_Total": FP + FN,
+            "Sensitivity": sensitivity,
+            "Specificity": specificity,
+            "Accuracy": accuracy
+        })
+
+        patient[f"Prediction_{rule_name}"] = patient_prediction
+
+        patient[f"Correct_{rule_name}"] = (
+            patient_prediction == gt
+        ).astype(int)
+
+    all_patient_results.append(patient)
+
+# =====================================================
+# SAVE RESULTS
+# =====================================================
+
+patient_results = pd.concat(
+    all_patient_results,
+    ignore_index=True
+)
+
+rule_results = pd.DataFrame(all_rule_results)
+
+patient_results.to_csv(
+    OUTPUT_DIR / "Individual_Patient_Quantitative_Results.csv",
+    index=False
+)
+
+rule_results.to_csv(
+    OUTPUT_DIR / "All_Decision_Rule_Results.csv",
+    index=False
+)
+
+# =====================================================
+# MAIN COMPARISON TABLE
+# =====================================================
+
+main_rules = [
+    "At_least_1_image",
+    "At_least_2_images",
+    "At_least_5_percent"
+]
+
+main_results = rule_results[
+    rule_results["Rule"].isin(main_rules)
+].copy()
+
+main_results.to_csv(
+    OUTPUT_DIR / "MAIN_Patient_Classification_Comparison.csv",
+    index=False
+)
+
+# =====================================================
+# VISUALISATION
+# =====================================================
+
+fig, axes = plt.subplots(
+    1, 3,
+    figsize=(18, 7),
+    sharey=True
+)
+
+for ax, rule in zip(axes, main_rules):
+
+    data = rule_results[
+        rule_results["Rule"] == rule
+    ].set_index("Model").loc[MODELS]
+
+    y = np.arange(len(data))
+
+    ax.barh(
+        y,
+        data["Correct_Ganglion_Present"],
+        label="Correct ganglion-present"
+    )
+
+    ax.barh(
+        y,
+        data["Correct_Ganglion_Absent"],
+        left=data["Correct_Ganglion_Present"],
+        label="Correct ganglion-absent"
+    )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(MODELS)
+
+    ax.invert_yaxis()
+    ax.set_xlim(0, 29)
+
+    ax.set_title(rule.replace("_", " "))
+    ax.set_xlabel("Correctly classified patients")
+
+axes[0].legend(fontsize=8)
+
+plt.suptitle(
+    "UMMC External Validation: Patient Ganglion-Cell Presence Classification"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "Patient_Classification_Comparison.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+# =====================================================
+# FINAL PRINT
+# =====================================================
+
+print("\n" + "=" * 110)
+print("PATIENT-LEVEL GANGLION-CELL CLASSIFICATION")
+print("=" * 110)
+
+print(
+    main_results[
+        [
+            "Model",
+            "Rule",
+            "Correct_Ganglion_Present",
+            "Correct_Ganglion_Absent",
+            "False_Positive_Patients",
+            "False_Negative_Patients",
+            "Correct_Total",
+            "Accuracy"
+        ]
+    ].round(4).to_string(index=False)
+)
+
+print("\nSaved results to:", OUTPUT_DIR.resolve())
