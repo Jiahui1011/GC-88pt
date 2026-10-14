@@ -1,0 +1,1011 @@
+# ================================================================
+# PATIENT-LEVEL IMAGE CLASSIFICATION ANALYSIS
+#
+# Hirschsprung Disease — Ganglion Cell Detection
+#
+# PURPOSE:
+# Evaluate how accurately each model distinguishes
+# ganglion-positive and ganglion-negative images
+# WITHIN EACH PATIENT.
+#
+# IMPORTANT:
+# This is NOT specimen-level presence/absence classification.
+# This is NOT clinical HD diagnosis classification.
+#
+# DATA:
+# HKL Validation
+# UMMC External Test
+#
+# THRESHOLD:
+# Fixed confidence threshold = 0.50
+#
+# NO RETRAINING REQUIRED
+# ================================================================
+
+import os
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import (
+    confusion_matrix,
+    roc_auc_score,
+    roc_curve
+)
+
+warnings.filterwarnings("ignore")
+
+
+# ================================================================
+# 1. CONFIGURATION
+# ================================================================
+
+ROOT = Path("./Site_Split_Run")
+
+CACHE_DIR = (
+    ROOT
+    / "Threshold_Analytics"
+    / "cache_scores"
+)
+
+REFERENCE_DIR = (
+    ROOT
+    / "Patient_Reference_Audit"
+)
+
+OUTPUT_DIR = (
+    ROOT
+    / "Patient_Level_Image_Analysis"
+)
+
+TABLE_DIR = OUTPUT_DIR / "Tables"
+FIGURE_DIR = OUTPUT_DIR / "Figures"
+PATIENT_DIR = OUTPUT_DIR / "Individual_Patients"
+
+for folder in [
+    OUTPUT_DIR,
+    TABLE_DIR,
+    FIGURE_DIR,
+    PATIENT_DIR
+]:
+    folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+MODELS = [
+    "YOLOv5mu",
+    "YOLOv8m",
+    "YOLOv9c",
+    "YOLOv10m",
+    "YOLO11m",
+    "YOLO12m",
+    "YOLO26m",
+    "RT-DETR-L",
+    "Faster_RCNN",
+    "SSD_VGG16"
+]
+
+THRESHOLD = 0.50
+
+DATASETS = {
+    "HKL_Validation": "Validation",
+    "UMMC_External_Test": "Test"
+}
+
+
+# ================================================================
+# 2. LOAD PATIENT REFERENCE
+# ================================================================
+
+def load_reference(split):
+
+    file_path = (
+        REFERENCE_DIR
+        / f"{split}_Patient_Reference.csv"
+    )
+
+    df = pd.read_csv(file_path)
+
+    df["pid"] = (
+        df["pid"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    if df["pid"].duplicated().any():
+        raise ValueError(
+            f"Duplicate patient IDs: {file_path}"
+        )
+
+    if not (df["audit_status"] == "OK").all():
+        raise ValueError(
+            f"Unresolved audit warnings: {file_path}"
+        )
+
+    return df
+
+
+references = {
+    split: load_reference(split)
+    for split in ["Validation", "Test"]
+}
+
+
+# ================================================================
+# 3. LOAD PREDICTION CACHE
+# ================================================================
+
+def load_cache(model, split):
+
+    file_path = (
+        CACHE_DIR
+        / f"{model}_{split}.csv"
+    )
+
+    if not file_path.exists():
+        raise FileNotFoundError(file_path)
+
+    df = pd.read_csv(file_path)
+
+    required = {"pid", "gt", "score"}
+
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError(
+            f"Missing columns in {file_path}: {missing}"
+        )
+
+    df["pid"] = (
+        df["pid"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    df["gt"] = pd.to_numeric(
+        df["gt"],
+        errors="raise"
+    )
+
+    df["score"] = pd.to_numeric(
+        df["score"],
+        errors="raise"
+    )
+
+    if not df["gt"].isin([0, 1]).all():
+        raise ValueError(
+            f"Invalid GT values in {file_path}"
+        )
+
+    if not np.isfinite(df["score"]).all():
+        raise ValueError(
+            f"Invalid scores in {file_path}"
+        )
+
+    if not df["score"].between(0, 1).all():
+        raise ValueError(
+            f"Scores outside [0,1]: {file_path}"
+        )
+
+    return df
+
+
+# ================================================================
+# 4. METRIC FUNCTIONS
+# ================================================================
+
+def safe_divide(numerator, denominator):
+
+    if denominator == 0:
+        return np.nan
+
+    return numerator / denominator
+
+
+def calculate_metrics(
+    y_true,
+    scores,
+    threshold=0.50
+):
+
+    y_true = np.asarray(
+        y_true,
+        dtype=int
+    )
+
+    scores = np.asarray(
+        scores,
+        dtype=float
+    )
+
+    y_pred = (
+        scores >= threshold
+    ).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(
+        y_true,
+        y_pred,
+        labels=[0, 1]
+    ).ravel()
+
+    sensitivity = safe_divide(
+        tp,
+        tp + fn
+    )
+
+    specificity = safe_divide(
+        tn,
+        tn + fp
+    )
+
+    accuracy = safe_divide(
+        tp + tn,
+        tp + tn + fp + fn
+    )
+
+    precision = safe_divide(
+        tp,
+        tp + fp
+    )
+
+    f1 = safe_divide(
+        2 * tp,
+        2 * tp + fp + fn
+    )
+
+    if len(np.unique(y_true)) == 2:
+
+        auc = roc_auc_score(
+            y_true,
+            scores
+        )
+
+    else:
+
+        auc = np.nan
+
+    return {
+        "N_Images": len(y_true),
+        "N_Positive": int(np.sum(y_true == 1)),
+        "N_Negative": int(np.sum(y_true == 0)),
+        "TP": int(tp),
+        "TN": int(tn),
+        "FP": int(fp),
+        "FN": int(fn),
+        "Sensitivity": sensitivity,
+        "Specificity": specificity,
+        "Accuracy": accuracy,
+        "Precision": precision,
+        "F1": f1,
+        "AUC": auc
+    }
+
+
+# ================================================================
+# 5. MAIN PATIENT-LEVEL ANALYSIS
+# ================================================================
+
+patient_results = []
+pooled_results = []
+
+for dataset_name, split in DATASETS.items():
+
+    print("\n" + "=" * 100)
+    print(f"DATASET: {dataset_name}")
+    print("=" * 100)
+
+    reference = references[split]
+
+    for model in MODELS:
+
+        print(f"Processing {model} ...")
+
+        cache = load_cache(
+            model,
+            split
+        )
+
+        cache_ids = set(cache["pid"])
+        reference_ids = set(reference["pid"])
+
+        if cache_ids != reference_ids:
+
+            raise ValueError(
+                f"{model} {split}: "
+                f"Patient IDs do not match reference.\n"
+                f"Missing: {reference_ids - cache_ids}\n"
+                f"Extra: {cache_ids - reference_ids}"
+            )
+
+        # --------------------------------------------------------
+        # Verify tile ground truth against audited patient totals
+        # --------------------------------------------------------
+
+        if {
+            "n_tiles",
+            "n_positive_tiles",
+            "n_negative_tiles"
+        }.issubset(reference.columns):
+
+            counts = (
+                cache.groupby("pid")
+                .agg(
+                    n_tiles=("gt", "size"),
+                    n_positive_tiles=("gt", "sum")
+                )
+                .reset_index()
+            )
+
+            counts["n_negative_tiles"] = (
+                counts["n_tiles"]
+                - counts["n_positive_tiles"]
+            )
+
+            check = reference.merge(
+                counts,
+                on="pid",
+                suffixes=("_reference", "_cache"),
+                validate="one_to_one"
+            )
+
+            for col in [
+                "n_tiles",
+                "n_positive_tiles",
+                "n_negative_tiles"
+            ]:
+
+                if not (
+                    check[f"{col}_reference"]
+                    == check[f"{col}_cache"]
+                ).all():
+
+                    raise ValueError(
+                        f"{model} {split}: "
+                        f"GT count mismatch for {col}"
+                    )
+
+        # --------------------------------------------------------
+        # Attach cohort information
+        # --------------------------------------------------------
+
+        cache = cache.merge(
+            reference[
+                [
+                    "pid",
+                    "cohort"
+                ]
+            ],
+            on="pid",
+            how="left",
+            validate="many_to_one"
+        )
+
+        if cache["cohort"].isna().any():
+            raise ValueError(
+                f"Missing cohort information: {model}"
+            )
+
+        # --------------------------------------------------------
+        # Individual patient evaluation
+        # --------------------------------------------------------
+
+        for pid, patient_df in cache.groupby("pid"):
+
+            metrics = calculate_metrics(
+                patient_df["gt"],
+                patient_df["score"],
+                THRESHOLD
+            )
+
+            metrics.update({
+                "Dataset": dataset_name,
+                "Model": model,
+                "Patient": pid,
+                "Cohort": patient_df["cohort"].iloc[0],
+                "Threshold": THRESHOLD
+            })
+
+            patient_results.append(metrics)
+
+        # --------------------------------------------------------
+        # Pooled image-level evaluation
+        # --------------------------------------------------------
+
+        pooled = calculate_metrics(
+            cache["gt"],
+            cache["score"],
+            THRESHOLD
+        )
+
+        pooled.update({
+            "Dataset": dataset_name,
+            "Model": model,
+            "Threshold": THRESHOLD
+        })
+
+        pooled_results.append(pooled)
+
+
+# ================================================================
+# 6. SAVE INDIVIDUAL PATIENT RESULTS
+# ================================================================
+
+patient_df = pd.DataFrame(
+    patient_results
+)
+
+pooled_df = pd.DataFrame(
+    pooled_results
+)
+
+patient_df = patient_df.sort_values(
+    [
+        "Dataset",
+        "Model",
+        "Patient"
+    ]
+)
+
+patient_df.to_csv(
+    TABLE_DIR
+    / "All_Individual_Patient_Results.csv",
+    index=False
+)
+
+pooled_df.to_csv(
+    TABLE_DIR
+    / "Pooled_Image_Level_Results.csv",
+    index=False
+)
+
+
+# ================================================================
+# 7. PATIENT-LEVEL SUMMARY
+# ================================================================
+
+METRICS = [
+    "Sensitivity",
+    "Specificity",
+    "Accuracy",
+    "Precision",
+    "F1",
+    "AUC"
+]
+
+summary_rows = []
+
+for (dataset, model), group in patient_df.groupby(
+    ["Dataset", "Model"]
+):
+
+    row = {
+        "Dataset": dataset,
+        "Model": model,
+        "N_Patients": len(group),
+        "Total_Images": int(group["N_Images"].sum()),
+        "Threshold": THRESHOLD
+    }
+
+    for metric in METRICS:
+
+        valid = group[metric].dropna()
+
+        row[f"{metric}_N"] = len(valid)
+
+        row[f"{metric}_Mean"] = (
+            valid.mean()
+            if len(valid) > 0
+            else np.nan
+        )
+
+        row[f"{metric}_SD"] = (
+            valid.std(ddof=1)
+            if len(valid) > 1
+            else np.nan
+        )
+
+        row[f"{metric}_Median"] = (
+            valid.median()
+            if len(valid) > 0
+            else np.nan
+        )
+
+        row[f"{metric}_Min"] = (
+            valid.min()
+            if len(valid) > 0
+            else np.nan
+        )
+
+        row[f"{metric}_Max"] = (
+            valid.max()
+            if len(valid) > 0
+            else np.nan
+        )
+
+    summary_rows.append(row)
+
+
+summary_df = pd.DataFrame(
+    summary_rows
+)
+
+summary_df.to_csv(
+    TABLE_DIR
+    / "Patient_Level_Model_Summary.csv",
+    index=False
+)
+
+
+# ================================================================
+# 8. COHORT-LEVEL PATIENT SUMMARY
+# ================================================================
+
+cohort_rows = []
+
+for (dataset, model, cohort), group in patient_df.groupby(
+    [
+        "Dataset",
+        "Model",
+        "Cohort"
+    ]
+):
+
+    row = {
+        "Dataset": dataset,
+        "Model": model,
+        "Cohort": cohort,
+        "N_Patients": len(group),
+        "Total_Images": int(group["N_Images"].sum())
+    }
+
+    for metric in METRICS:
+
+        valid = group[metric].dropna()
+
+        row[f"{metric}_N"] = len(valid)
+
+        row[f"{metric}_Mean"] = (
+            valid.mean()
+            if len(valid) > 0
+            else np.nan
+        )
+
+        row[f"{metric}_SD"] = (
+            valid.std(ddof=1)
+            if len(valid) > 1
+            else np.nan
+        )
+
+        row[f"{metric}_Median"] = (
+            valid.median()
+            if len(valid) > 0
+            else np.nan
+        )
+
+    cohort_rows.append(row)
+
+
+cohort_df = pd.DataFrame(
+    cohort_rows
+)
+
+cohort_df.to_csv(
+    TABLE_DIR
+    / "Patient_Level_Cohort_Summary.csv",
+    index=False
+)
+
+
+# ================================================================
+# 9. UMMC EXTERNAL PATIENT-LEVEL COMPARISON
+# ================================================================
+
+external_summary = summary_df[
+    summary_df["Dataset"]
+    == "UMMC_External_Test"
+].copy()
+
+external_summary = external_summary.sort_values(
+    "Accuracy_Mean",
+    ascending=False
+)
+
+external_summary.to_csv(
+    TABLE_DIR
+    / "FINAL_UMMC_Patient_Level_Comparison.csv",
+    index=False
+)
+
+
+# ================================================================
+# 10. PATIENT-LEVEL ACCURACY BAR CHART
+# ================================================================
+
+plot_df = external_summary.sort_values(
+    "Accuracy_Mean",
+    ascending=True
+)
+
+fig, ax = plt.subplots(
+    figsize=(10, 7)
+)
+
+ax.barh(
+    plot_df["Model"],
+    plot_df["Accuracy_Mean"]
+)
+
+ax.set_xlim(0, 1.05)
+
+ax.set_xlabel(
+    "Mean accuracy across patients"
+)
+
+ax.set_title(
+    "UMMC External Validation\n"
+    "Patient-Level Image Classification Accuracy"
+)
+
+ax.grid(
+    axis="x",
+    alpha=0.25
+)
+
+for i, value in enumerate(
+    plot_df["Accuracy_Mean"]
+):
+
+    ax.text(
+        value + 0.01,
+        i,
+        f"{value:.3f}",
+        va="center",
+        fontsize=9
+    )
+
+plt.tight_layout()
+
+plt.savefig(
+    FIGURE_DIR
+    / "UMMC_Patient_Level_Accuracy_Comparison.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ================================================================
+# 11. PATIENT-LEVEL SENSITIVITY / SPECIFICITY PLOT
+# ================================================================
+
+plot_df = external_summary.sort_values(
+    "Accuracy_Mean",
+    ascending=False
+)
+
+x = np.arange(len(plot_df))
+
+width = 0.35
+
+fig, ax = plt.subplots(
+    figsize=(13, 6)
+)
+
+ax.bar(
+    x - width / 2,
+    plot_df["Sensitivity_Mean"],
+    width,
+    label="Mean sensitivity"
+)
+
+ax.bar(
+    x + width / 2,
+    plot_df["Specificity_Mean"],
+    width,
+    label="Mean specificity"
+)
+
+ax.set_xticks(x)
+
+ax.set_xticklabels(
+    plot_df["Model"],
+    rotation=45,
+    ha="right"
+)
+
+ax.set_ylim(0, 1.05)
+
+ax.set_ylabel(
+    "Mean patient-level metric"
+)
+
+ax.set_title(
+    "UMMC External Validation\n"
+    "Mean Patient Sensitivity and Specificity"
+)
+
+ax.legend()
+
+ax.grid(
+    axis="y",
+    alpha=0.25
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    FIGURE_DIR
+    / "UMMC_Patient_Sensitivity_Specificity.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ================================================================
+# 12. PATIENT ACCURACY HEATMAP
+# ================================================================
+
+external_patients = patient_df[
+    patient_df["Dataset"]
+    == "UMMC_External_Test"
+].copy()
+
+heatmap_df = external_patients.pivot(
+    index="Patient",
+    columns="Model",
+    values="Accuracy"
+)
+
+heatmap_df = heatmap_df.reindex(
+    columns=MODELS
+)
+
+# Sort patients by cohort, then patient ID.
+
+patient_order = (
+    external_patients[
+        [
+            "Patient",
+            "Cohort"
+        ]
+    ]
+    .drop_duplicates()
+    .sort_values(
+        [
+            "Cohort",
+            "Patient"
+        ]
+    )["Patient"]
+    .tolist()
+)
+
+heatmap_df = heatmap_df.reindex(
+    patient_order
+)
+
+fig, ax = plt.subplots(
+    figsize=(15, 12)
+)
+
+im = ax.imshow(
+    heatmap_df.values,
+    aspect="auto",
+    cmap="viridis",
+    vmin=0,
+    vmax=1
+)
+
+ax.set_xticks(
+    np.arange(len(MODELS))
+)
+
+ax.set_xticklabels(
+    MODELS,
+    rotation=45,
+    ha="right"
+)
+
+ax.set_yticks(
+    np.arange(len(heatmap_df))
+)
+
+ax.set_yticklabels(
+    heatmap_df.index
+)
+
+ax.set_title(
+    "UMMC External Test\n"
+    "Individual Patient Image Classification Accuracy"
+)
+
+cbar = plt.colorbar(
+    im,
+    ax=ax
+)
+
+cbar.set_label(
+    "Accuracy"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    FIGURE_DIR
+    / "UMMC_Patient_Accuracy_Heatmap.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ================================================================
+# 13. COHORT-LEVEL ACCURACY PLOT
+# ================================================================
+
+external_cohort = cohort_df[
+    cohort_df["Dataset"]
+    == "UMMC_External_Test"
+].copy()
+
+cohort_pivot = external_cohort.pivot(
+    index="Model",
+    columns="Cohort",
+    values="Accuracy_Mean"
+)
+
+cohort_pivot = cohort_pivot.reindex(
+    MODELS
+)
+
+ax = cohort_pivot.plot(
+    kind="bar",
+    figsize=(14, 7)
+)
+
+ax.set_ylim(0, 1.05)
+
+ax.set_ylabel(
+    "Mean patient accuracy"
+)
+
+ax.set_title(
+    "UMMC External Validation\n"
+    "Patient-Level Accuracy by Specimen Cohort"
+)
+
+ax.legend(
+    title="Cohort",
+    bbox_to_anchor=(1.02, 1),
+    loc="upper left"
+)
+
+plt.xticks(
+    rotation=45,
+    ha="right"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    FIGURE_DIR
+    / "UMMC_Cohort_Accuracy_Comparison.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ================================================================
+# 14. SAVE EACH MODEL'S PATIENT RESULTS
+# ================================================================
+
+for model in MODELS:
+
+    model_df = external_patients[
+        external_patients["Model"] == model
+    ].copy()
+
+    model_df.to_csv(
+        PATIENT_DIR
+        / f"{model}_UMMC_Patient_Results.csv",
+        index=False
+    )
+
+
+# ================================================================
+# 15. FINAL SUMMARY
+# ================================================================
+
+print("\n" + "=" * 110)
+print("PATIENT-LEVEL IMAGE CLASSIFICATION ANALYSIS COMPLETED")
+print("=" * 110)
+
+print("\nUMMC EXTERNAL VALIDATION — PATIENT-LEVEL SUMMARY")
+print("=" * 110)
+
+columns = [
+    "Model",
+    "N_Patients",
+    "Total_Images",
+    "Accuracy_Mean",
+    "Accuracy_SD",
+    "Sensitivity_Mean",
+    "Specificity_Mean",
+    "F1_Mean",
+    "AUC_Mean"
+]
+
+print(
+    external_summary[
+        columns
+    ].round(4).to_string(index=False)
+)
+
+print("\n" + "=" * 110)
+print("UMMC EXTERNAL VALIDATION — POOLED IMAGE-LEVEL RESULTS")
+print("=" * 110)
+
+pooled_external = pooled_df[
+    pooled_df["Dataset"]
+    == "UMMC_External_Test"
+].copy()
+
+print(
+    pooled_external[
+        [
+            "Model",
+            "N_Images",
+            "TP",
+            "TN",
+            "FP",
+            "FN",
+            "Sensitivity",
+            "Specificity",
+            "Accuracy",
+            "F1",
+            "AUC"
+        ]
+    ].round(4).to_string(index=False)
+)
+
+print("\n" + "=" * 110)
+print("OUTPUT FILES")
+print("=" * 110)
+
+print("\nMain results:")
+print(
+    TABLE_DIR
+    / "FINAL_UMMC_Patient_Level_Comparison.csv"
+)
+
+print(
+    TABLE_DIR
+    / "All_Individual_Patient_Results.csv"
+)
+
+print(
+    TABLE_DIR
+    / "Patient_Level_Cohort_Summary.csv"
+)
+
+print(
+    TABLE_DIR
+    / "Pooled_Image_Level_Results.csv"
+)
+
+print("\nFigures saved in:")
+print(FIGURE_DIR.resolve())
+
+print("\nANALYSIS COMPLETED SUCCESSFULLY")
