@@ -1,0 +1,306 @@
+"""Tile-level ROC/AUROC for 10 HKL-trained ganglion-cell detectors.
+
+Runs existing checkpoints on HKL validation and UMMC external test images.
+No retraining. Positive tile = >=1 YOLO ganglion annotation.
+Score = maximum class-1 detection confidence (0 when none).
+Inference confidence is 0.001, NOT the classification cutoff 0.50.
+
+Outputs in Site_Split_Run/Tile_AUROC_Analysis:
+  tile_scores/{model}_{val|test}.csv (restartable)
+  AUROC_internal_external.csv
+  ROC_HKL_validation.png/.pdf; ROC_UMMC_external.png/.pdf
+  ROC_curves_points.csv
+
+Run: python hkl_ummc_tile_auroc_10_models.py
+To recompute cached scores: set FORCE_INFERENCE=True.
+"""
+import os
+import re
+import csv
+import gc
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+from PIL import Image
+import torchvision.transforms.functional as TF
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, ssd300_vgg16
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.models.detection.ssd import SSDHead
+from ultralytics import YOLO, RTDETR
+from sklearn.metrics import roc_auc_score, roc_curve
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# ============================= CONFIG =============================
+PROJECT_ROOT = Path('./Site_Split_Run')
+DATASET_YAML = Path('./site_split_hkl_ummc/data.yaml').resolve()
+OUT_DIR = PROJECT_ROOT / 'Tile_AUROC_Analysis'
+IMG_SIZE = 640
+INFERENCE_CONF = 0.001  # preserves nearly the full detection confidence range
+MAX_DET = 300  # higher than the 100 used for box metrics, to capture tile maximum
+DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+FORCE_INFERENCE = False
+SAVE_EVERY = 250  # periodically save progress so long runs can resume
+
+MODEL_PATHS = {
+    'YOLOv5mu': PROJECT_ROOT/'YOLOv5mu_Baseline/weights/best.pt',
+    'YOLOv8m': PROJECT_ROOT/'YOLOv8m_Baseline/weights/best.pt',
+    'YOLOv9c': PROJECT_ROOT/'YOLOv9c_Baseline/weights/best.pt',
+    'YOLOv10m': PROJECT_ROOT/'YOLOv10m_Baseline/weights/best.pt',
+    'YOLO11m': PROJECT_ROOT/'YOLO11m_Baseline/weights/best.pt',
+    'YOLO12m': PROJECT_ROOT/'YOLO12m_Baseline/weights/best.pt',
+    'YOLO26m': PROJECT_ROOT/'YOLO26m_Baseline/weights/best.pt',
+    'RT-DETR-L': PROJECT_ROOT/'RT-DETR-L_Baseline/weights/best.pt',
+    'Faster R-CNN': PROJECT_ROOT/'Faster_RCNN_optimized_best.pth',
+    'SSD-VGG16': PROJECT_ROOT/'SSD_VGG16_optimized_best.pth',
+}
+# ==================================================================
+
+
+def get_split_paths(split):
+    data = yaml.safe_load(DATASET_YAML.read_text())
+    value = data[split]
+    if isinstance(value, list):
+        result = []
+        for entry in value:
+            result.extend(resolve_entry(entry))
+        return sorted(set(result), key=str)
+    return resolve_entry(value)
+
+
+def resolve_entry(entry):
+    raw = Path(str(entry))
+    options = [raw, DATASET_YAML.parent/raw]
+    root = yaml.safe_load(DATASET_YAML.read_text()).get('path')
+    if root:
+        root = Path(str(root))
+        if not root.is_absolute():
+            root = (DATASET_YAML.parent/root).resolve()
+        options.append(root/raw)
+    target = next((p for p in options if p.exists()), None)
+    if target is None:
+        raise FileNotFoundError(f'Cannot locate dataset entry {entry!r}; tried {options}')
+    if target.is_dir():
+        exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
+        return sorted((p.resolve() for p in target.rglob('*') if p.suffix.lower() in exts), key=str)
+    if target.suffix.lower() != '.txt':
+        raise ValueError(f'Expected image directory or .txt image list: {target}')
+    result = []
+    for line in target.read_text().splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        p = Path(name)
+        opts = [p, target.parent/p, DATASET_YAML.parent/p]
+        found = next((x for x in opts if x.is_file()), None)
+        if found is None:
+            raise FileNotFoundError(f'Image listed in {target} not found: {name}')
+        result.append(found.resolve())
+    return result
+
+
+def label_path_for(image_path):
+    parts = list(image_path.parts)
+    indices = [i for i, part in enumerate(parts) if part == 'images']
+    if not indices:
+        raise ValueError(f'Image path has no images/ directory: {image_path}')
+    parts[indices[-1]] = 'labels'
+    return Path(*parts).with_suffix('.txt')
+
+
+def tile_label(image_path):
+    p = label_path_for(image_path)
+    if not p.is_file():
+        raise FileNotFoundError(f'Missing ground-truth label: {p}')
+    # Single-class ganglion dataset; empty text file means negative tile.
+    return int(any(len(line.split()) >= 5 for line in p.read_text().splitlines()))
+
+
+def patient_id(image_path):
+    m = re.search(r'([A-Za-z]+\d+)HE\d+', image_path.stem, re.I)
+    return m.group(1).upper() if m else image_path.stem.split('_')[0].upper()
+
+
+def make_torchvision(name):
+    if name == 'Faster R-CNN':
+        ag = AnchorGenerator(sizes=((16,), (32,), (64,), (128,), (256,)),
+                             aspect_ratios=((0.5, 1.0, 2.0),)*5)
+        model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None,
+            rpn_anchor_generator=ag, min_size=640, max_size=640,
+            box_score_thresh=0.001)
+        nf = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(nf, 2)
+    elif name == 'SSD-VGG16':
+        model = ssd300_vgg16(weights=None, weights_backbone=None)
+        anchors = model.anchor_generator.num_anchors_per_location()
+        model.head = SSDHead([512, 1024, 512, 256, 256, 256], anchors, num_classes=2)
+    else:
+        raise ValueError(name)
+    state = torch.load(MODEL_PATHS[name], map_location='cpu', weights_only=True)
+    model.load_state_dict(state, strict=True)
+    return model.to(DEVICE).eval()
+
+
+def load_model(name):
+    if name in ('Faster R-CNN', 'SSD-VGG16'):
+        return make_torchvision(name)
+    if name == 'RT-DETR-L':
+        return RTDETR(str(MODEL_PATHS[name]))
+    return YOLO(str(MODEL_PATHS[name]))
+
+
+def tile_score(name, model, path):
+    if name not in ('Faster R-CNN', 'SSD-VGG16'):
+        r = model.predict(str(path), imgsz=IMG_SIZE, conf=INFERENCE_CONF,
+                          device=DEVICE, max_det=MAX_DET, verbose=False)[0]
+        if r.boxes is None or len(r.boxes) == 0:
+            return 0.0
+        return float(r.boxes.conf.max().item())
+    with Image.open(path) as im:
+        rgb = im.convert('RGB').resize((IMG_SIZE, IMG_SIZE), Image.Resampling.BILINEAR)
+    tensor = TF.to_tensor(rgb).to(DEVICE)
+    with torch.inference_mode():
+        output = model([tensor])[0]
+    mask = output['labels'] == 1
+    if not mask.any().item():
+        return 0.0
+    # torchvision models return confidence-ranked outputs after their internal postprocessing.
+    # Filter to ganglion class and take max confidence, independent of IoU box matching.
+    return float(output['scores'][mask].max().item())
+
+
+def save_atomic(df, path):
+    tmp = path.with_suffix('.tmp')
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def scores_for_split(name, model, split, paths, labels):
+    output = OUT_DIR/'tile_scores'/f'{name.replace(" ", "_")}_{split}.csv'
+    expected = {str(p) for p in paths}
+    if FORCE_INFERENCE and output.exists():
+        output.unlink()
+    if output.exists():
+        existing = pd.read_csv(output, dtype={'image': str, 'patient': str})
+        required = {'image', 'patient', 'gt', 'score'}
+        if not required.issubset(existing.columns):
+            raise ValueError(f'Cached file has unexpected columns: {output}')
+        if existing['image'].duplicated().any():
+            raise ValueError(f'Duplicate images in cached file: {output}')
+        extras = set(existing['image']) - expected
+        if extras:
+            raise ValueError(f'Cache has {len(extras)} images outside current {split} split: {output}')
+        known = {str(p): int(y) for p, y in zip(paths, labels)}
+        if any(int(row.gt) != known[row.image] for row in existing.itertuples()):
+            raise ValueError(f'Cached ground truth differs from current dataset: {output}')
+        records = existing.to_dict('records')
+    else:
+        records = []
+    done = {r['image'] for r in records}
+    remaining = [(p, int(y)) for p, y in zip(paths, labels) if str(p) not in done]
+    print(f'  {name} {split}: {len(done)} cached; {len(remaining)} remaining', flush=True)
+    for i, (p, y) in enumerate(remaining, 1):
+        score = tile_score(name, model, p)
+        records.append(dict(image=str(p), patient=patient_id(p), gt=y, score=score))
+        if i % SAVE_EVERY == 0:
+            save_atomic(pd.DataFrame(records), output)
+            print(f'    {i}/{len(remaining)} new tiles processed', flush=True)
+    df = pd.DataFrame(records)
+    save_atomic(df, output)
+    if len(df) != len(paths):
+        raise AssertionError(f'Incomplete {name} {split}: {len(df)} vs {len(paths)}')
+    return df
+
+
+def main():
+    (OUT_DIR/'tile_scores').mkdir(parents=True, exist_ok=True)
+    for name, weight in MODEL_PATHS.items():
+        if not weight.is_file():
+            raise FileNotFoundError(f'Missing checkpoint for {name}: {weight}')
+    splits = {}
+    for split in ('val', 'test'):
+        paths = get_split_paths(split)
+        if len(paths) != len(set(paths)):
+            raise ValueError(f'Duplicate image paths in {split} split')
+        labels = np.asarray([tile_label(p) for p in paths], dtype=int)
+        if len(np.unique(labels)) != 2:
+            raise ValueError(f'{split} split needs both positive and negative tiles for AUROC')
+        splits[split] = (paths, labels)
+        print(f'{split}: {len(paths)} tiles; positive={labels.sum()}; negative={(labels==0).sum()}')
+
+    metrics, curves = [], []
+    for name in MODEL_PATHS:
+        print(f'\nMODEL: {name}', flush=True)
+        # Skip loading the checkpoint if both full score caches are complete.
+        complete = True
+        for split, (paths, _) in splits.items():
+            cache = OUT_DIR/'tile_scores'/f'{name.replace(" ", "_")}_{split}.csv'
+            if not cache.is_file():
+                complete = False
+                break
+            try:
+                existing = pd.read_csv(cache, usecols=['image'])
+                if set(existing['image']) != {str(p) for p in paths} or len(existing) != len(paths):
+                    complete = False
+            except Exception:
+                complete = False
+        model = None if (complete and not FORCE_INFERENCE) else load_model(name)
+        for split, (paths, labels) in splits.items():
+            df = scores_for_split(name, model, split, paths, labels)
+            y = df['gt'].to_numpy(dtype=int)
+            s = df['score'].to_numpy(dtype=float)
+            if not np.isfinite(s).all() or ((s < 0) | (s > 1)).any():
+                raise ValueError(f'Invalid confidence scores: {name} {split}')
+            auc = roc_auc_score(y, s)
+            fpr, tpr, thresholds = roc_curve(y, s)
+            metrics.append(dict(Model=name, Dataset='HKL_internal_validation' if split=='val' else 'UMMC_external_test',
+                N_images=len(df), N_positive=int(y.sum()), N_negative=int((y==0).sum()), AUROC=float(auc)))
+            curves.append((name, split, fpr, tpr, thresholds))
+            print(f'    AUROC = {auc:.5f}', flush=True)
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        save_atomic(pd.DataFrame(metrics), OUT_DIR/'AUROC_internal_external_partial.csv')
+
+    long_df = pd.DataFrame(metrics)
+    pivot = long_df.pivot(index='Model', columns='Dataset', values='AUROC').reindex(MODEL_PATHS)
+    pivot = pivot.rename_axis(None, axis=1).reset_index()
+    pivot['UMMC_minus_HKL'] = pivot['UMMC_external_test'] - pivot['HKL_internal_validation']
+    pivot.to_csv(OUT_DIR/'AUROC_internal_external.csv', index=False)
+    long_df.to_csv(OUT_DIR/'AUROC_by_dataset_long.csv', index=False)
+    curve_rows = []
+    for name, split, fpr, tpr, th in curves:
+        curve_rows.extend(dict(Model=name, Dataset=split, FPR=float(a), TPR=float(b), Threshold=float(c))
+                          for a, b, c in zip(fpr, tpr, th))
+    pd.DataFrame(curve_rows).to_csv(OUT_DIR/'ROC_curves_points.csv', index=False)
+    for split, title, filename in [
+        ('val', 'HKL internal validation (tile-level ROC)', 'ROC_HKL_validation'),
+        ('test', 'UMMC external testing (tile-level ROC)', 'ROC_UMMC_external')]:
+        fig, ax = plt.subplots(figsize=(9, 7.5))
+        for name, sp, fpr, tpr, _ in curves:
+            if sp == split:
+                auc = next(r['AUROC'] for r in metrics if r['Model']==name and
+                           r['Dataset']==('HKL_internal_validation' if split=='val' else 'UMMC_external_test'))
+                ax.plot(fpr, tpr, lw=1.6, label=f'{name}  ({auc:.3f})')
+        ax.plot([0, 1], [0, 1], 'k--', lw=1, alpha=.6)
+        ax.set(xlim=(0,1), ylim=(0,1), xlabel='False-positive rate (1 − specificity)',
+               ylabel='True-positive rate (sensitivity)', title=title)
+        ax.grid(alpha=.18)
+        ax.legend(loc='lower right', fontsize=8, framealpha=.92)
+        fig.tight_layout()
+        fig.savefig(OUT_DIR/f'{filename}.png', dpi=300)
+        fig.savefig(OUT_DIR/f'{filename}.pdf')
+        plt.close(fig)
+    print('\nDONE. Results saved in:', OUT_DIR.resolve())
+    print(pivot.round(4).to_string(index=False))
+    print('\nNOTE: Tile-level AUROC; tiles from the same patient are correlated.')
+
+
+if __name__ == '__main__':
+    main()
