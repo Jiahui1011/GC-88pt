@@ -1,0 +1,358 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+
+# =====================================================
+# CONFIGURATION
+# =====================================================
+
+ROOT = Path("./Site_Split_Run/Patient_Ganglion_Quantitative_Analysis")
+
+INPUT_FILE = ROOT / "Individual_Patient_Quantitative_Results.csv"
+
+OUTPUT_DIR = ROOT / "Distribution_Analysis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+MODELS = [
+    "YOLOv5mu",
+    "YOLOv8m",
+    "YOLOv9c",
+    "YOLOv10m",
+    "YOLO11m",
+    "YOLO12m",
+    "YOLO26m",
+    "RT-DETR-L",
+    "Faster_RCNN",
+    "SSD_VGG16"
+]
+
+THRESHOLD = 5.0
+
+# =====================================================
+# LOAD DATA
+# =====================================================
+
+df = pd.read_csv(INPUT_FILE)
+
+df["Ground_Truth_Status"] = np.where(
+    df["GT_Patient_Status"] == 1,
+    "Ganglion-present",
+    "Ganglion-absent"
+)
+
+df["Pred_Positive_Percentage"] = pd.to_numeric(
+    df["Pred_Positive_Percentage"]
+)
+
+assert df.groupby("Model")["pid"].nunique().eq(29).all()
+
+# =====================================================
+# FIGURE 1:
+# PATIENT-LEVEL DISTRIBUTION FOR EACH MODEL
+# =====================================================
+
+sns.set_theme(style="whitegrid")
+
+fig, axes = plt.subplots(
+    2, 5,
+    figsize=(22, 10),
+    sharey=True
+)
+
+axes = axes.flatten()
+
+for i, model in enumerate(MODELS):
+
+    ax = axes[i]
+
+    subset = df[df["Model"] == model]
+
+    sns.stripplot(
+        data=subset,
+        x="Ground_Truth_Status",
+        y="Pred_Positive_Percentage",
+        order=["Ganglion-absent", "Ganglion-present"],
+        hue="Ground_Truth_Status",
+        palette={
+            "Ganglion-absent": "#D55E00",
+            "Ganglion-present": "#0072B2"
+        },
+        jitter=0.18,
+        size=6,
+        alpha=0.85,
+        ax=ax,
+        legend=False
+    )
+
+    ax.axhline(
+        THRESHOLD,
+        color="red",
+        linestyle="--",
+        linewidth=1.5,
+        label="5% threshold"
+    )
+
+    ax.set_title(model, fontsize=13, fontweight="bold")
+
+    ax.set_xlabel("")
+    ax.set_ylabel("Predicted positive images (%)")
+
+    ax.tick_params(axis="x", rotation=20)
+
+    ax.set_ylim(-2, 102)
+
+fig.suptitle(
+    "Distribution of Predicted Ganglion-Positive Image Percentages\n"
+    "UMMC External Validation (29 Patients)",
+    fontsize=18,
+    fontweight="bold"
+)
+
+plt.tight_layout(rect=[0, 0, 1, 0.93])
+
+plt.savefig(
+    OUTPUT_DIR / "Patient_Positive_Percentage_Distribution.png",
+    dpi=600,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+# =====================================================
+# FIGURE 2:
+# MINIMUM POSITIVE VS MAXIMUM NEGATIVE
+# =====================================================
+
+summary_rows = []
+
+for model in MODELS:
+
+    subset = df[df["Model"] == model]
+
+    positive = subset[
+        subset["GT_Patient_Status"] == 1
+    ]["Pred_Positive_Percentage"]
+
+    negative = subset[
+        subset["GT_Patient_Status"] == 0
+    ]["Pred_Positive_Percentage"]
+
+    summary_rows.append({
+        "Model": model,
+        "Positive_Min": positive.min(),
+        "Positive_Median": positive.median(),
+        "Positive_Max": positive.max(),
+        "Negative_Min": negative.min(),
+        "Negative_Median": negative.median(),
+        "Negative_Max": negative.max(),
+        "Separation_Gap": positive.min() - negative.max()
+    })
+
+summary = pd.DataFrame(summary_rows)
+
+summary.to_csv(
+    OUTPUT_DIR / "Positive_Percentage_Distribution_Summary.csv",
+    index=False
+)
+
+fig, ax = plt.subplots(figsize=(13, 7))
+
+x = np.arange(len(MODELS))
+
+ax.scatter(
+    x,
+    summary["Positive_Min"],
+    s=110,
+    marker="o",
+    label="Minimum ganglion-present percentage"
+)
+
+ax.scatter(
+    x,
+    summary["Negative_Max"],
+    s=110,
+    marker="s",
+    label="Maximum ganglion-absent percentage"
+)
+
+ax.axhline(
+    THRESHOLD,
+    color="red",
+    linestyle="--",
+    linewidth=1.5,
+    label="5% threshold"
+)
+
+ax.set_xticks(x)
+ax.set_xticklabels(MODELS, rotation=45, ha="right")
+
+ax.set_ylabel("Predicted ganglion-positive images (%)")
+ax.set_title(
+    "Minimum Positive vs Maximum Negative Percentage\n"
+    "Across 29 UMMC Patients",
+    fontsize=15,
+    fontweight="bold"
+)
+
+ax.legend()
+ax.grid(axis="y", alpha=0.3)
+
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "Positive_Negative_Separation.png",
+    dpi=600,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+# =====================================================
+# FIGURE 3:
+# INDIVIDUAL PATIENT HEATMAP (ANONYMISED)
+# =====================================================
+
+# Create patient × model matrix
+pivot = df.pivot(
+    index="pid",
+    columns="Model",
+    values="Pred_Positive_Percentage"
+)
+
+# Ensure models follow the specified order
+pivot = pivot.reindex(columns=MODELS)
+
+# =====================================================
+# STEP 1: GET PATIENT GROUND-TRUTH STATUS
+# =====================================================
+
+patient_status = (
+    df.drop_duplicates("pid")
+    .set_index("pid")["GT_Patient_Status"]
+)
+
+# Arrange patients:
+# Ganglion-absent (0) first
+# Ganglion-present (1) second
+ordered_patients = (
+    patient_status
+    .sort_values(kind="stable")
+    .index
+)
+
+# Reorder heatmap BEFORE anonymisation
+pivot = pivot.reindex(ordered_patients)
+
+# Verify that no values are missing
+assert not pivot.isna().any().any(), \
+    "Missing values detected in heatmap!"
+
+# =====================================================
+# STEP 2: ANONYMISE PATIENT IDENTIFIERS
+# =====================================================
+
+anonymous_ids = [
+    f"P{i:02d}"
+    for i in range(1, len(pivot) + 1)
+]
+
+pivot.index = anonymous_ids
+
+# Number of ganglion-absent patients
+n_negative = int((patient_status == 0).sum())
+
+# Number of ganglion-present patients
+n_positive = int((patient_status == 1).sum())
+
+print(f"Ganglion-absent patients: {n_negative}")
+print(f"Ganglion-present patients: {n_positive}")
+
+# =====================================================
+# STEP 3: GENERATE HEATMAP
+# =====================================================
+
+fig, ax = plt.subplots(figsize=(15, 12))
+
+sns.heatmap(
+    pivot,
+    cmap="YlGnBu",
+    annot=True,
+    fmt=".1f",
+    linewidths=0.3,
+    vmin=0,
+    vmax=100,
+    cbar_kws={
+        "label": "Predicted ganglion-positive images (%)"
+    },
+    ax=ax
+)
+
+# =====================================================
+# STEP 4: SEPARATE THE TWO REFERENCE GROUPS
+# =====================================================
+
+ax.axhline(
+    y=n_negative,
+    color="red",
+    linewidth=2.5
+)
+
+# =====================================================
+# STEP 5: FORMATTING
+# =====================================================
+
+ax.set_title(
+    "Predicted Ganglion-Positive Image Percentage\n"
+    "Across 29 UMMC Patients and 10 Models",
+    fontsize=15,
+    fontweight="bold",
+    pad=15
+)
+
+ax.set_xlabel(
+    "Object Detection Model",
+    fontsize=12
+)
+
+ax.set_ylabel(
+    "Anonymised Patient ID",
+    fontsize=12
+)
+
+plt.xticks(rotation=90)
+plt.yticks(rotation=0)
+
+plt.tight_layout()
+
+# =====================================================
+# STEP 6: SAVE FIGURE
+# =====================================================
+
+plt.savefig(
+    OUTPUT_DIR / "Patient_Positive_Percentage_Heatmap_Anonymised.png",
+    dpi=600,
+    bbox_inches="tight"
+)
+
+plt.savefig(
+    OUTPUT_DIR / "Patient_Positive_Percentage_Heatmap_Anonymised.pdf",
+    bbox_inches="tight"
+)
+
+plt.show()
+
+# =====================================================
+# STEP 7: SAVE ANONYMISED DATA
+# =====================================================
+
+pivot.to_csv(
+    OUTPUT_DIR / "Anonymised_Patient_Positive_Percentages.csv"
+)
+
+print("\nHeatmap successfully generated.")
+print(f"Total patients: {len(pivot)}")
+print(f"Ganglion-absent: P01–P{n_negative:02d}")
+print(f"Ganglion-present: P{n_negative+1:02d}–P{len(pivot):02d}")
